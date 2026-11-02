@@ -1,0 +1,8 @@
+fastapi==0.115.6
+httpx
+pytest
+pillow
+numpy<2.3
+python-multipart==0.0.20
+pydantic>=2
+opencv-python-headless>=4.10,<4.12

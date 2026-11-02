@@ -1,0 +1,6 @@
+# Python >= 3.10 (cvat-sdk uses `X | None` annotations). Keep cvat-sdk equal to the CVAT server version.
+cvat-sdk==2.78.0
+requests
+pillow
+numpy
+opencv-python-headless>=4.10,<4.12

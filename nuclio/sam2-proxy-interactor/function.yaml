@@ -1,0 +1,38 @@
+# Thin interactor: no model, no torch. It only forwards CVAT's request to the persistent service.
+metadata:
+  name: sam2-service-interactor
+  namespace: cvat
+  annotations:
+    name: Segment Anything 2 (local service)
+    version: 2
+    type: interactor
+    spec:
+    min_pos_points: 1
+    min_neg_points: 0
+    startswith_box_optional: true
+    help_message: Click on the object (positive points), optionally refine with negative points or start with a box.
+
+spec:
+  description: Interactive segmentation via the persistent local SAM 2 service
+  runtime: 'python:3.10'
+  handler: main:handler
+  eventTimeout: 60s
+  env:
+    - name: SAM2_SERVICE_URL
+      value: http://sam2-service:8000
+  build:
+    image: cvat.local.sam2.interactor-proxy
+    baseImage: python:3.10-slim
+  triggers:
+    myHttpTrigger:
+      maxWorkers: 2
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 10000
+      attributes:
+        maxRequestBodySize: 33554432  # 32MB
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: volume

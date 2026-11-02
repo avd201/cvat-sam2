@@ -1,0 +1,53 @@
+# Joins CVAT's compose network (named `cvat_cvat` by CVAT's own deploy scripts) so that the
+# Nuclio proxy function can reach the service as http://sam2-service:8000.
+services:
+  sam2-service:
+    build:
+      context: .
+      dockerfile: sam-service/Dockerfile
+    container_name: sam2-service
+    restart: unless-stopped
+    volumes:
+      - ./checkpoints:/checkpoints:ro
+    environment:
+      LOG_LEVEL: INFO
+      EMBEDDING_CACHE_SIZE: "4"
+      MAX_PROPAGATION_FRAMES: "600"
+      MAX_OBJECTS: "8"  # objects tracked together in one request (VRAM grows with objects x frames)
+      # Where the service downloads frames from (with the caller's forwarded session). CVAT's own container name.
+      CVAT_INTERNAL_URL: http://cvat_server:8080
+      # Django rejects Host headers with an underscore (like `cvat_server`) with HTTP 400, so send a valid one.
+      CVAT_HOST_HEADER: ${CVAT_HOST:-localhost}
+    ports:
+      # Host-local only: the CLI (running on the host) talks to the service here. Not reachable
+      # from other machines. The service has NO authentication.
+      - "127.0.0.1:8000:8000"
+    labels:
+      # Expose ONLY the endpoint used by the CVAT UI plugin, on CVAT's own address (same origin => the browser
+      # sends its CVAT session cookie, no CORS). That endpoint authenticates every call against CVAT before any
+      # GPU work. The raw endpoints (/v1/interact, /v1/video/propagate) have no login check and stay private.
+      traefik.enable: "true"
+      traefik.docker.network: cvat_cvat
+      traefik.http.services.sam2.loadbalancer.server.port: "8000"
+      traefik.http.routers.sam2.rule: Host(`${CVAT_HOST:-localhost}`) && Path(`/sam2/v1/video/propagate-job`)
+      traefik.http.routers.sam2.entrypoints: web
+      traefik.http.routers.sam2.middlewares: sam2-strip
+      traefik.http.middlewares.sam2-strip.stripprefix.prefixes: /sam2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [cvat_cvat]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+networks:
+  cvat_cvat:
+    external: true
