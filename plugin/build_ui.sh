@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the CVAT UI image with the SAM 2 plugin compiled in (replaces the local cvat/ui:<tag> image).
-# Usage: sudo ./plugin/build_ui.sh <path-to-CVAT-checkout> [image-tag]      (default tag: v2.78.0)
+# Builds a dedicated CVAT UI image with the SAM 2 plugin compiled in.
+# Usage: ./plugin/build_ui.sh <path-to-CVAT-checkout> [cvat-version] (default: v2.78.0)
 set -euo pipefail
-CVAT="${1:?usage: build_ui.sh <path-to-CVAT-checkout> [image-tag]}"
+CVAT="${1:?usage: build_ui.sh <path-to-CVAT-checkout> [cvat-version]}"
 TAG="${2:-v2.78.0}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -22,10 +22,10 @@ PLUGIN_VERSION="$(cat "$HERE/VERSION")"
 echo "export const PLUGIN_VERSION = '$PLUGIN_VERSION';" > "$DEST/src/ts/version.ts"
 echo "Building SAM 2 plugin version: $PLUGIN_VERSION"
 
-docker build -f "$CVAT/Dockerfile.ui" --build-arg CLIENT_PLUGINS=plugins/sam2-propagate -t "cvat/ui:$TAG" "$CVAT"
+IMAGE="cvat/ui:sam2-${TAG}-${PLUGIN_VERSION}"
+docker build -f "$CVAT/Dockerfile.ui" --build-arg CLIENT_PLUGINS=plugins/sam2-propagate -t "$IMAGE" "$CVAT"
 echo
-echo "Built cvat/ui:$TAG with plugin version $PLUGIN_VERSION."
-echo "NOTE: a build that finishes in a few seconds with every step CACHED did NOT pick up new code"
-echo "      (usually: an old zip was extracted). Check: cat $HERE/VERSION"
-echo "Recreate the UI container:"
-echo "  cd $CVAT && sudo docker compose -f docker-compose.yml -f components/serverless/docker-compose.serverless.yml up -d cvat_ui"
+echo "Built $IMAGE with plugin version $PLUGIN_VERSION."
+echo "From the cvat-sam2 root, recreate the UI container:"
+echo "  ./scripts/compose.sh cvat up -d --no-deps --force-recreate cvat_ui"
+echo "For HTTPS add --https before cvat. Hard-refresh and check the browser console version."

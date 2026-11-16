@@ -1,0 +1,7 @@
+# Apply after CVAT's base and serverless files. Built by plugin/build_ui.sh.
+# A stock image pull cannot replace this image; build it locally before starting CVAT.
+services:
+  cvat_ui:
+    image: cvat/ui:sam2-v2.78.0-2026-11-13.1-retained-interpolation
+    pull_policy: never
+

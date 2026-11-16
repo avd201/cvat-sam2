@@ -1,0 +1,13 @@
+# Add-on for HTTPS. Use it TOGETHER with CVAT's own HTTPS overlay (docker-compose.https.yml), which moves CVAT's
+# routers to the `websecure` entrypoint (:443) and makes plain HTTP redirect there. Without this file our /sam2
+# router would stay on `web`, i.e. behind that redirect, and the plugin's POST would never reach the service.
+#
+#   ./scripts/compose.sh --https sam2 up -d --force-recreate
+# Reads the same .env as CVAT. See docs/DEPLOYMENT.md for DNS, certificates and CVAT setup.
+#
+# `lets-encrypt` is the certificate resolver defined by CVAT's docker-compose.https.yml (v2.78.0). Not verified live.
+services:
+  sam2-service:
+    labels:
+      traefik.http.routers.sam2.entrypoints: websecure
+      traefik.http.routers.sam2.tls.certresolver: lets-encrypt

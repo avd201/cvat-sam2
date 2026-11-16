@@ -11,9 +11,17 @@ services:
       - ./checkpoints:/checkpoints:ro
     environment:
       LOG_LEVEL: INFO
-      EMBEDDING_CACHE_SIZE: "4"
-      MAX_PROPAGATION_FRAMES: "600"
-      MAX_OBJECTS: "8"  # objects tracked together in one request (VRAM grows with objects x frames)
+      EMBEDDING_CACHE_SIZE: "${EMBEDDING_CACHE_SIZE:-4}"
+      MAX_PROPAGATION_FRAMES: "${MAX_PROPAGATION_FRAMES:-600}"
+      MAX_OBJECTS: "${MAX_OBJECTS:-8}"  # VRAM grows with objects x frames
+      # One propagation runs at a time; others WAIT in a FIFO queue. MAX_QUEUE = how many may wait behind the
+      # running one (more -> HTTP 429). A waiting request that nobody polls for QUEUE_STALE_S seconds is dropped.
+      MAX_QUEUE: "${MAX_QUEUE:-8}"
+      QUEUE_STALE_S: "300"
+      # Optional cap (GiB) on PyTorch's GPU memory, to rehearse a smaller card (e.g. the 24 GB A10) on a bigger one.
+      # Empty = no cap. Set it in a `.env` file next to this compose file (see .env.example); `sudo` drops exported
+      # shell variables, a `.env` file is read regardless.
+      GPU_MEMORY_LIMIT_GB: "${GPU_MEMORY_LIMIT_GB:-}"
       # Where the service downloads frames from (with the caller's forwarded session). CVAT's own container name.
       CVAT_INTERNAL_URL: http://cvat_server:8080
       # Django rejects Host headers with an underscore (like `cvat_server`) with HTTP 400, so send a valid one.

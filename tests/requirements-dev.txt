@@ -1,8 +1,11 @@
+# Everything the automated tests need (service, CLI logic, queue, real-server test).
+# Exact versions = the ones the suite last passed with (Python 3.12, Linux x86_64).
+# The complete transitive set is in requirements-dev.lock (`pip install -r tests/requirements-dev.lock` reproduces it exactly).
+# The service IMAGE is pinned separately (sam-service/constraints.txt, see README), because it runs another Python.
+-r ../cli/requirements.txt
 fastapi==0.115.6
-httpx
-pytest
-pillow
-numpy<2.3
+httpx==0.28.1
+pytest==9.2.0
 python-multipart==0.0.20
-pydantic>=2
-opencv-python-headless>=4.10,<4.12
+pydantic==2.14.2
+uvicorn==0.34.0

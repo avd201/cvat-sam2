@@ -28,7 +28,7 @@ def png_b64(w=120, h=80, seed=0) -> str:
 @pytest.fixture()
 def client():
     app.state.backend = FakeBackend(cache_size=2)
-    app.state.propagation_lock = None  # recreated by the lifespan
+    app.state.gpu_queue = None  # recreated by the lifespan
     with TestClient(app) as c:
         yield c
     app.state.backend = None

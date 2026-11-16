@@ -8,14 +8,15 @@ import Modal from 'antd/lib/modal';
 import { ComponentBuilder, PluginEntryPoint } from 'components/plugins-entrypoint';
 import { Job, ObjectState } from 'cvat-core-wrapper';
 import {
-    LooseShape, OutputKind, allowedOutputs, buildBody, buildMultiBody, commonOutputs, pointsAreValid, suggestGroup,
-    summarizeGroups, toAbsolute, unsupportedReason,
+    LooseShape, Message, OutputKind, allowedOutputs, buildBody, buildMultiBody, commonOutputs, droppedFrames,
+    pointsAreValid, roiLinesFromStates, suggestGroup, summarizeGroups, toAbsolute, unsupportedReason,
 } from './plan';
 import { runPropagation, runPropagationMulti } from './service';
 import { applyResults, deleteForward } from './apply';
+import { boxSourceKey, convertToBoxTracks } from './boxes';
 import { PLUGIN_VERSION } from './version';
 import Sam2Dialog, {
-    DeleteDialog, ObjectChoice, ProgressReporter, RunConfig,
+    BoxDialog, DeleteDialog, ObjectChoice, ProgressReporter, RunConfig,
 } from './ui';
 
 const MENU_PATH = 'annotationPage.menuActions.items';
@@ -112,6 +113,15 @@ const builder: ComponentBuilder = ({
             });
             return;
         }
+        // Region of interest: polylines labelled `roi_line` on this frame (draw them as a TRACK so they stay on every frame).
+        const roi = roiLinesFromStates((store.getState().annotation.annotations.states ?? []) as ObjectState[]);
+        if (roi.problems.length) {
+            Modal.warning({
+                title: TITLE,
+                content: <span style={{ whiteSpace: 'pre-line' }}>{roi.problems.join('\n')}</span>,
+            });
+            return;
+        }
         const outputs = commonOutputs(perObject);
         if (!outputs.length) {
             Modal.warning({
@@ -162,8 +172,13 @@ const builder: ComponentBuilder = ({
                     promptPoints: first.points as number[],
                     output: config.output,
                     simplifyPx: SIMPLIFY_PX,
+                    roiLines: roi.lines,
                 });
-                const relative = await runPropagation(body, (count) => report('propagating', count, total), signal);
+                let final: Message | null = null;
+                const relative = await runPropagation(
+                    body, (count) => report('propagating', count, total), signal, (ahead) => report('queued', ahead, 0),
+                    (m) => { final = m; },
+                );
                 const results = toAbsolute(relative, frame);
                 const broken = invalid(results);
                 if (broken) {
@@ -181,7 +196,10 @@ const builder: ComponentBuilder = ({
                     targetGroup: config.targetGroup,
                 });
                 refresh(frame);
-                return summary;
+                const left = droppedFrames(final, frame).get(1);
+                return left === undefined
+                    ? summary
+                    : `${summary}\nLeft the region of interest at frame ${left}: the track ends there.`;
             }
 
             // Several objects: ONE request (the frames are fetched and loaded once, all objects tracked in one pass).
@@ -195,10 +213,14 @@ const builder: ComponentBuilder = ({
                 })),
                 output: config.output,
                 simplifyPx: SIMPLIFY_PX,
+                roiLines: roi.lines,
             });
+            let final: Message | null = null;
             const perObj = await runPropagationMulti(
                 body, (count) => report('propagating', count, total * states.length), signal,
+                (ahead) => report('queued', ahead, 0), (m) => { final = m; },
             );
+            const leftAt = droppedFrames(final, frame);
             // Validate every object's results BEFORE writing any of them.
             const resultsFor = states.map((_, i) => toAbsolute(perObj.get(i + 1) as Map<number, number[] | null>, frame));
             for (let i = 0; i < states.length; i++) {
@@ -224,7 +246,9 @@ const builder: ComponentBuilder = ({
                         output: config.output,
                         targetGroup: null,
                     });
-                    applied.push(`${describe(states[i])}: ${summary}`);
+                    const left = leftAt.get(i + 1);
+                    applied.push(`${describe(states[i])}: ${summary}`
+                        + `${left === undefined ? '' : ` Left the region of interest at frame ${left}.`}`);
                 } catch (error) {
                     refresh(frame); // show what was written so far
                     throw new Error(
@@ -247,6 +271,7 @@ const builder: ComponentBuilder = ({
                 ownGroup={ownGroup}
                 choices={choices}
                 suggested={suggested}
+                roiLines={roi.lines.length}
                 run={run}
                 onClose={closeDialog}
             />,
@@ -309,6 +334,38 @@ const builder: ComponentBuilder = ({
         );
     };
 
+    const openBoxes = (): void => {
+        if (root) return;
+        const selection = resolveSelection();
+        if (typeof selection === 'string') {
+            Modal.info({ title: TITLE, content: selection });
+            return;
+        }
+        const { job, frame, states } = selection;
+        try { states.forEach(boxSourceKey); } catch (error) {
+            Modal.warning({ title: TITLE, content: (error as Error).message });
+            return;
+        }
+        show(
+            <BoxDialog
+                objectLines={states.map(describe)}
+                run={async (replaceOriginals, report, signal) => {
+                    try {
+                        return await convertToBoxTracks(job, states, replaceOriginals, report, signal);
+                    } finally {
+                        refresh(frame); // also show imported boxes if source removal failed partway
+                    }
+                }}
+                onClose={closeDialog}
+            />,
+        );
+    };
+
+    const boxItem = ({ key }: { key: string | number }) => ({
+        key: `sam2-boxes-${key}`,
+        label: 'SAM 2: convert to box tracks…',
+        onClick: openBoxes,
+    });
     const propagateItem = ({ key }: { key: string | number }) => ({
         key: `sam2-propagate-${key}`,
         label: 'SAM 2: propagate object(s)…',
@@ -321,6 +378,8 @@ const builder: ComponentBuilder = ({
     });
     dispatch(actionCreators.addUIComponent(MENU_PATH, propagateItem as any, { weight: 15, shouldBeRendered: () => true }));
     dispatch(actionCreators.addUIComponent(MENU_PATH, deleteItem as any, { weight: 16, shouldBeRendered: () => true }));
+
+    dispatch(actionCreators.addUIComponent(MENU_PATH, boxItem as any, { weight: 17, shouldBeRendered: () => true }));
 
     const onKeyDown = (event: KeyboardEvent): void => {
         if (!(event.altKey && event.shiftKey)) return;
@@ -339,6 +398,7 @@ const builder: ComponentBuilder = ({
             window.removeEventListener('keydown', onKeyDown);
             dispatch(actionCreators.removeUIComponent(MENU_PATH, propagateItem as any));
             dispatch(actionCreators.removeUIComponent(MENU_PATH, deleteItem as any));
+            dispatch(actionCreators.removeUIComponent(MENU_PATH, boxItem as any));
             closeDialog();
         },
     };

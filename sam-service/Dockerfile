@@ -4,10 +4,16 @@ FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 # Pinned to the sam2 commit inspected during research (HEAD of main, 2024-12-15).
 ARG SAM2_COMMIT=2b90b9f5ceec907a1c18123530e92e794ad901a4
-RUN pip install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git@${SAM2_COMMIT}"
 WORKDIR /srv
-COPY sam-service/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# sam-service/constraints.txt (optional, the trailing * makes the COPY tolerate its absence) pins every Python
+# dependency, including the ones sam2 pulls in. Generate it from a known-good container with
+# scripts/freeze_service_deps.sh. Without it the build still works but is NOT reproducible.
+COPY sam-service/requirements.txt sam-service/constraints.txt* ./
+RUN C=""; \
+    if [ -f constraints.txt ]; then C="-c constraints.txt"; \
+    else echo "WARNING: sam-service/constraints.txt not found: dependencies are NOT pinned (scripts/freeze_service_deps.sh)"; fi; \
+    pip install --no-cache-dir $C "git+https://github.com/facebookresearch/sam2.git@${SAM2_COMMIT}" \
+    && pip install --no-cache-dir $C -r requirements.txt
 COPY sam2common ./sam2common
 COPY sam-service/app ./app
 # SEG_BACKEND: "sam2" = image + video (Stage 2), "sam2-image" = image only (Stage 1 behaviour).

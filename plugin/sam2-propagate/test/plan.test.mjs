@@ -55,7 +55,7 @@ test('error texts are specific', () => {
     assert.match(errorText(405, '<html><head><title>405 Not Allowed</title></head></html>'), /route is not active in CVAT's Traefik \(HTTP 405/);
     assert.match(errorText(405, '{"detail":"Method Not Allowed"}'), /HTTP 405: Method Not Allowed/); // FastAPI's own 405 is JSON
     assert.match(errorText(404, '{"detail":"CVAT: job or frame not found"}'), /HTTP 404: CVAT: job or frame not found/);
-    assert.match(errorText(429, '{"detail":"busy"}'), /busy/);
+    assert.match(errorText(429, '{"detail":"queue is full"}'), /queue is full/);
     assert.match(errorText(502, 'Bad Gateway'), /not reachable/);
     assert.match(errorText(502, '{"detail":"CVAT answered HTTP 400 for /api/users/self"}'), /SAM 2 service error \(HTTP 502\): CVAT answered HTTP 400/);
     assert.match(errorText(400, '{"detail":[{"msg":"x"}]}'), /HTTP 400: \[\{"msg":"x"\}\]/);
@@ -174,4 +174,54 @@ test('one output format for a mixed selection', () => {
 
 test('a 422 hints at an outdated service', () => {
     assert.match(errorText(422, '{"detail":[{"msg":"Field required"}]}'), /may be outdated; rebuild sam2-service/);
+});
+
+// ---- region of interest ------------------------------------------------------------------------------------------
+import { ROI_LABEL, droppedFrames, roiLinesFromStates } from '../src/ts/plan.ts';
+
+const roiPoly = (name, points, extra = {}) => ({ label: { name }, shapeType: 'polyline', points, ...extra });
+
+test('ROI lines: 2-point and 3-point polylines labelled roi_line are collected as they are', () => {
+    const r = roiLinesFromStates([roiPoly(ROI_LABEL, [0, 0, 10, 0]), roiPoly(ROI_LABEL, [0, 5, 10, 5, 3, 9])]);
+    assert.deepEqual(r.lines, [[0, 0, 10, 0], [0, 5, 10, 5, 3, 9]]);
+    assert.deepEqual(r.problems, []);
+});
+
+test('ROI lines: other labels, other shapes and lines marked outside are ignored', () => {
+    const r = roiLinesFromStates([
+        roiPoly('chicken', [0, 0, 10, 0]),
+        { label: { name: 'chicken' }, shapeType: 'polygon', points: [0, 0, 1, 0, 1, 1] },
+        roiPoly(ROI_LABEL, [0, 0, 10, 0], { outside: true }),
+    ]);
+    assert.deepEqual(r, { lines: [], problems: [] });
+});
+
+test('ROI lines: a wrong number of points or a wrong shape type is reported, never guessed', () => {
+    const r = roiLinesFromStates([
+        roiPoly(ROI_LABEL, [0, 0, 5, 5, 9, 9, 1, 1]),
+        roiPoly(ROI_LABEL, [0, 0]),
+        { label: { name: ROI_LABEL }, shapeType: 'polygon', points: [0, 0, 1, 0, 1, 1] },
+    ]);
+    assert.deepEqual(r.lines, []);
+    assert.equal(r.problems.length, 3);
+    assert.match(r.problems[0], /4 points; it needs exactly 2/);
+    assert.match(r.problems[1], /1 points/);
+    assert.match(r.problems[2], /is a polygon; it must be a polyline/);
+});
+
+test('request bodies carry roi_lines only when there are lines', () => {
+    const base = { jobId: 1, org: '', fromFrame: 0, toFrame: 3, output: 'polygon', simplifyPx: 1.5 };
+    const single = { ...base, promptType: 'polygon', promptPoints: [0, 0, 1, 0, 1, 1] };
+    const multi = { ...base, objects: [{ id: 1, promptType: 'polygon', promptPoints: [0, 0, 1, 0, 1, 1] }] };
+    assert.equal('roi_lines' in buildBody(single), false);
+    assert.equal('roi_lines' in buildBody({ ...single, roiLines: [] }), false);
+    assert.deepEqual(buildBody({ ...single, roiLines: [[0, 0, 5, 5]] }).roi_lines, [[0, 0, 5, 5]]);
+    assert.equal('roi_lines' in buildMultiBody(multi), false);
+    assert.deepEqual(buildMultiBody({ ...multi, roiLines: [[0, 0, 5, 5, 1, 9]] }).roi_lines, [[0, 0, 5, 5, 1, 9]]);
+});
+
+test('dropped frames are turned into absolute frame numbers', () => {
+    assert.deepEqual([...droppedFrames({ done: true, dropped: { 1: 8, 3: 2 } }, 40)], [[1, 48], [3, 42]]);
+    assert.equal(droppedFrames({ done: true }, 40).size, 0);
+    assert.equal(droppedFrames(null, 40).size, 0);
 });

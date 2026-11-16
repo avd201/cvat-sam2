@@ -11,6 +11,7 @@ export const SERVICE_PATH = '/sam2/v1/video/propagate-job';
 
 export interface Message {
     obj?: number; // multi-object streams: which object this result is for
+    queued?: number; // still waiting for the GPU: number of runs ahead of this one (the running one counts)
     objects?: number; // multi-object `done` line: how many objects the service tracked
     frame?: number;
     points?: number[] | null;
@@ -18,6 +19,8 @@ export interface Message {
     frames?: number;
     output?: string;
     error?: string;
+    roi_lines?: number; // `done` line: how many ROI lines the service applied (echo of the request)
+    dropped?: Record<string, number>; // `done` line: object id -> frame (relative to the prompt) where it left the ROI
 }
 
 export interface PromptObject {
@@ -27,6 +30,7 @@ export interface PromptObject {
 }
 
 export interface PropagateBody {
+    roi_lines?: number[][]; // region of interest, see ROI_LABEL
     job_id: number;
     org: string;
     from_frame: number;
@@ -78,7 +82,7 @@ export function pointsAreValid(kind: OutputKind, points: number[] | null): boole
 
 export function buildBody(a: {
     jobId: number; org: string; fromFrame: number; toFrame: number; promptType: OutputKind;
-    promptPoints: number[]; output: OutputKind; simplifyPx: number;
+    promptPoints: number[]; output: OutputKind; simplifyPx: number; roiLines?: number[][];
 }): PropagateBody {
     return {
         job_id: a.jobId,
@@ -89,6 +93,7 @@ export function buildBody(a: {
         prompt_points: a.promptPoints,
         output: a.output,
         simplify_px: a.simplifyPx,
+        ...(a.roiLines?.length ? { roi_lines: a.roiLines } : {}),
     };
 }
 
@@ -96,7 +101,7 @@ export function buildBody(a: {
 export function buildMultiBody(a: {
     jobId: number; org: string; fromFrame: number; toFrame: number;
     objects: { id: number; promptType: OutputKind; promptPoints: number[] }[];
-    output: OutputKind; simplifyPx: number;
+    output: OutputKind; simplifyPx: number; roiLines?: number[][];
 }): PropagateBody {
     return {
         job_id: a.jobId,
@@ -106,7 +111,48 @@ export function buildMultiBody(a: {
         objects: a.objects.map((o) => ({ id: o.id, prompt_type: o.promptType, prompt_points: o.promptPoints })),
         output: a.output,
         simplify_px: a.simplifyPx,
+        ...(a.roiLines?.length ? { roi_lines: a.roiLines } : {}),
     };
+}
+
+/** Label name that marks a polyline as a region-of-interest line (see the README). */
+export const ROI_LABEL = 'roi_line';
+
+export interface RoiStateLike {
+    label: { name: string };
+    shapeType: string;
+    points?: number[];
+    outside?: boolean;
+    clientID?: number | null;
+}
+
+/**
+ * Region-of-interest lines among the objects of the current frame: polylines labelled `roi_line`.
+ * 2 points = the line, kept side is on the LEFT of the drawing direction (as seen on screen);
+ * 3 points = the line, then a point on the side to KEEP. Anything else is reported, never guessed.
+ * Lines that are marked outside on this frame are ignored.
+ */
+export function roiLinesFromStates(states: RoiStateLike[]): { lines: number[][]; problems: string[] } {
+    const lines: number[][] = [];
+    const problems: string[] = [];
+    states.filter((s) => s.label.name === ROI_LABEL && !s.outside).forEach((s, i) => {
+        const p = s.points ?? [];
+        if (s.shapeType !== 'polyline') {
+            problems.push(`'${ROI_LABEL}' object ${i + 1} is a ${s.shapeType}; it must be a polyline.`);
+        } else if (p.length !== 4 && p.length !== 6) {
+            problems.push(`'${ROI_LABEL}' polyline ${i + 1} has ${p.length / 2} points; it needs exactly 2 (kept side = left of the drawing direction) or 3 (the third marks the kept side).`);
+        } else {
+            lines.push([...p]);
+        }
+    });
+    return { lines, problems };
+}
+
+/** Objects the service dropped for leaving the region of interest: object id -> ABSOLUTE frame number. */
+export function droppedFrames(final: Message | null, fromFrame: number): Map<number, number> {
+    const out = new Map<number, number>();
+    Object.entries(final?.dropped ?? {}).forEach(([obj, rel]) => out.set(Number(obj), fromFrame + rel));
+    return out;
 }
 
 /**
@@ -145,7 +191,7 @@ export function errorText(status: number, bodyText: string): string {
     if (status === 422) {
         return `The service rejected the request (HTTP 422: ${detail}). It may be outdated; rebuild sam2-service.`;
     }
-    if (status === 429) return 'The service is busy with another propagation; try again in a moment.';
+    if (status === 429) return 'The SAM 2 queue is full (too many propagations are already waiting); try again in a moment.';
     if (status === 502 || status === 503 || status === 504) {
         // Our own service also answers 502 when CVAT misbehaves; its JSON message says what happened.
         if (bodyText.trim().startsWith('{') && detail) return `SAM 2 service error (HTTP ${status}): ${detail}`;

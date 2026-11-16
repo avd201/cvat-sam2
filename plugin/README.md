@@ -1,5 +1,15 @@
 # SAM 2 propagation plugin for CVAT Community (v2.78.0)
 
+## Retained-frame integrity fix (2026-11-13)
+
+Build `2026-11-13.1-retained-interpolation` preserves earlier geometry when deleting a polygon track's
+future or re-propagating from an interpolated prompt. The retained part of the affected interpolation
+interval becomes explicit per-frame keyframes; earlier intervals and existing keyframes are unchanged.
+This is necessary because CVAT re-matches polygon vertices when an interval is split: one boundary
+anchor alone does not preserve all shapes. Track IDs, visibility and per-frame metadata are retained.
+This can add keyframes and Undo entries. Save/reload/export has automated real-core round-trip coverage;
+live browser/server acceptance is still required. See [release notes](../UPDATE_INTERPOLATION_2026-11-13.md).
+
 Adds two entries, **"SAM 2: propagate object…"** (Alt+Shift+P) and **"SAM 2: delete object from here…"** (Alt+Shift+D), to the annotation page's top-left **Menu** dropdown (between "Upload annotations" and "Export job dataset") (and the shortcut
 **Alt+Shift+P**). Select one object, go to the frame where it is correct, run it: SAM 2 tracks it forward and the
 result appears in the job immediately (no reload). Press **Ctrl+S** to save.
@@ -22,19 +32,23 @@ range and prompt; the service downloads the frames itself from CVAT **using the 
 CVAT's own permissions apply and an unauthenticated caller never reaches the GPU. Only that endpoint is routed
 through Traefik (see `docker-compose.sam2.yml`).
 
-## Build / install (once per CVAT version)
-Prerequisites: CVAT checkout **at tag v2.78.0**, `sam2-service` rebuilt from this repo and running.
-```
-sudo ./plugin/build_ui.sh ~/cvat/cvat            # ~10+ min, several GB RAM; builds cvat/ui:v2.78.0 with the plugin
-cd ~/cvat/cvat && sudo docker compose -f docker-compose.yml -f components/serverless/docker-compose.serverless.yml up -d cvat_ui
-cd ~/cvat/cvat-sam2 && sudo docker compose -f docker-compose.sam2.yml up -d --build --force-recreate   # Traefik labels
-```
-Hard-refresh the browser (Ctrl+Shift+R). A CVAT upgrade requires a rebuild against the new tag, and a re-check that the
-APIs below still exist.
+## Build / install
+
+Follow the [deployment guide](../docs/DEPLOYMENT.md), including its existing-installation migration steps.
+The project root contains the release source; no ZIP extraction is needed.
+`plugin/build_ui.sh` builds a dedicated `cvat/ui:sam2-v2.78.0-<plugin-version>` image.
+Use `scripts/compose.sh` from the repository root to activate it with the required overlays.
+A CVAT upgrade requires compatibility work and a new UI build; v2.78.0 is the supported version.
+
+## Waiting for the GPU
+If another run is in progress the dialog says how many runs are ahead ("Waiting for the GPU: n propagation(s) ahead"); it then continues by itself. Cancel works while waiting. A full queue (HTTP 429) is reported as such.
+
+## Region of interest
+Polylines labelled `roi_line` on the current frame (2 or 3 points, see the main README) are sent with the run. The dialog shows how many were found; an object whose mask centroid leaves the region is dropped for good and the result message names the frame. A service that does not apply the region is refused.
 
 ## Verification done without a live CVAT
 - Type-checked against the real v2.78.0 `cvat-ui` / `cvat-core` sources (no new errors vs. the clean baseline).
-- `test/plan.test.mjs`: pure logic (`node --experimental-strip-types --test test/plan.test.mjs`).
+- `test/plan.test.mjs`: pure logic; `test/service.test.mjs`: the real stream client against a mocked `fetch` (queue lines, errors). Run both: `node --experimental-strip-types --test test/*.test.mjs`.
 - `test/core-harness/`: the plugin's real `apply.ts` run against the real `cvat-core` `Collection` class
   (`./test/core-harness/run.sh <cvat-checkout>`): mask re-propagation, polygon-track creation, in-place re-propagation
   with a lost object, closing marker, end of job. This caught a real bug (mixed-frame `removeBatch`).
@@ -66,9 +80,7 @@ APIs below still exist.
 
 ## Which build is running? (version stamp)
 `plugin/VERSION` is baked into the UI image by `build_ui.sh`. After a hard refresh, the browser console (F12) prints
-`[SAM 2 plugin] version <VERSION> loaded` when the plugin starts. If a build finishes in seconds with every Docker step
-`CACHED`, nothing new was compiled in: you most likely extracted an older zip (browsers rename repeated downloads to
-`name(2).zip`, `name(3).zip`, ...). Check with `cat plugin/VERSION` and compare with the zip you intended to install.
+`[SAM 2 plugin] version <VERSION> loaded` when the plugin starts. Docker may legitimately reuse cached layers. Verify the browser version against `cat plugin/VERSION` and the active container image instead of using build duration as evidence.
 
 ## Several objects at once
 Select **several objects on the same frame** and run **SAM 2: propagate object(s)…** once. In CVAT v2.78.0, hold the
@@ -82,3 +94,40 @@ Shift+click in the sidebar selects a range. The same applies to **delete object(
   If CVAT fails part-way while writing, the message lists exactly which objects were applied; nothing is rolled back.
 - "Result belongs to" (replace an existing object) is offered only when a single mask is selected.
 - A single object behaves exactly as before (and the service keeps its original single-object response format).
+
+
+## Convert existing objects to tight box tracks (2026-11-12)
+
+1. Select a polygon track, or a mask belonging to a propagated mask group. Ctrl/Cmd+click selects several objects.
+2. Open **Menu → SAM 2: convert to box tracks…**. Optionally check **Replace originals**, then click **Create box tracks**.
+3. Inspect the boxes, then press **Ctrl+S**. Conversion changes the browser copy until you save.
+
+This works across each selected object's full duration **within the current job**, including frames before the
+current frame. A polygon is evaluated through CVAT's own interpolation on every frame, then its coordinate
+minima/maxima become a rectangle keyframe. Boxes have zero rotation and **no added margin**.
+Mask groups become one rectangle track per group; missing frames get outside markers, so they are not
+interpolated across. Selecting several masks of the same group converts the group once. An ungrouped mask
+becomes a one-frame box track. Standalone polygon shapes and other shape types are not accepted by this action.
+
+Masks are scanned in RLE form for the true foreground bounds, including disconnected components; no largest-component
+filter is applied. The mask crop's bottom-right coordinate is inclusive. Boxes use pixel **edges**: a 10×10 mask
+at pixels x=10..19, y=20..29 becomes `[10, 20, 20, 30]`, with width and height 10. This is the tight boundary of
+the occupied pixels, not a padding option. Fractional polygon coordinates are retained without rounding.
+
+Original polygons/masks are **kept by default**. Check **Replace originals** to remove the converted polygon tracks
+and all masks of their selected groups within this job, after box creation succeeds. Box tracks receive new CVAT IDs
+in both modes; replacement does not retain the polygon track ID. The source label, group, source field,
+z-order, immutable attributes, per-frame mutable attributes and occlusion flags are carried over. New keyframes
+are written for every visible frame, including polygon frames that CVAT interpolated. Outside gaps and the end
+of an object are preserved. Tracks visible on the job's final frame remain visible there.
+
+Groups must identify one mask object: multiple masks on a frame, mixed labels, or changing immutable attribute
+values are refused before importing any boxes. All selected objects are planned and validated before the import.
+Cancel during preparation leaves annotations unchanged. Once boxes have been imported, replacement completes
+without further cancellation. A source-removal failure keeps the boxes and reports how many sources were removed;
+inspect the result before saving. Reference ground-truth annotations cannot be replaced. Repeating conversion creates another set of boxes;
+this initial version does not update earlier conversions. Re-propagating a source later also requires rebuilding
+its boxes manually. As with propagation, this import does not create a single Undo action.
+
+For installation and UI-only updates, follow the [deployment guide](../docs/DEPLOYMENT.md).
+The build script requires the CVAT checkout path and optionally its CVAT version (default `v2.78.0`).
