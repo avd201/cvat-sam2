@@ -1,5 +1,8 @@
 # cvat-sam2 — SAM 2 for CVAT Community
 
+Watch demon:
+[![Watch the video](https://img.youtube.com/vi/u4cDmiqPOdw/maxresdefault.jpg)](https://youtu.be/u4cDmiqPOdw)
+
 Run local SAM 2 segmentation and video propagation in CVAT Community. Select objects in the annotation UI, propagate them forward, correct them, or convert existing annotations to box tracks.
 
 **Start here: [Deployment guide](docs/DEPLOYMENT.md).** It covers a fresh Ubuntu/NVIDIA machine, CVAT, Nuclio, the SAM service, the UI plugin, HTTPS, verification, updates, and rollback.
