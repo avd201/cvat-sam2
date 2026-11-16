@@ -56,7 +56,7 @@ class FakeCvat:
 @pytest.fixture()
 def setup():
     backend, cvat = FakeBackend(), FakeCvat()
-    app.state.backend, app.state.cvat, app.state.propagation_lock = backend, cvat, None
+    app.state.backend, app.state.cvat, app.state.gpu_queue = backend, cvat, None
     with TestClient(app) as c:
         yield c, backend, cvat
     app.state.backend = app.state.cvat = None
@@ -382,3 +382,30 @@ def test_back_to_back_multi_runs_never_hit_429(setup):
     for _ in range(10):
         r = c.post("/v1/video/propagate-job", json=multi_body(to_frame=7))
         assert r.status_code == 200 and lines(r)[-1]["done"] is True
+
+
+def test_bad_request_shape_is_refused_before_any_download(setup):
+    c, backend, cvat = setup
+    r = c.post("/v1/video/propagate-job", json=body(prompt_type=None, prompt_points=None))  # neither prompt nor objects
+    assert r.status_code == 400
+    assert not [x for x in cvat.calls if x[0] == "frame"]                  # nothing was fetched from CVAT
+    h = c.get("/healthz").json()
+    assert h["queue_waiting"] == 0 and h["propagation_busy"] is False
+
+
+def test_failed_download_gives_the_queue_place_back(setup):
+    c, backend, cvat = setup
+    cvat.fail_frame = 7
+    assert c.post("/v1/video/propagate-job", json=body()).status_code == 404
+    h = c.get("/healthz").json()
+    assert h["queue_waiting"] == 0 and h["propagation_busy"] is False
+    cvat.fail_frame = None
+    assert lines(c.post("/v1/video/propagate-job", json=body()))[-1]["done"] is True
+
+
+def test_job_run_oom_is_reported_clearly(setup):
+    c, backend, cvat = setup
+    backend.oom_at_frame = 1
+    err = lines(c.post("/v1/video/propagate-job", json=multi_body(to_frame=8)))[-1]["error"]
+    assert "ran out of memory" in err and "2 object(s)" in err and "4 frames" in err
+    assert c.get("/healthz").json()["propagation_busy"] is False

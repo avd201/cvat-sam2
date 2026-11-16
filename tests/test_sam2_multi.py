@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "sam-service"))
 sys.path.insert(0, str(ROOT))
 
-from app.backends import BackendStats, Sam2VideoBackend  # noqa: E402
+from app.backends import BackendStats, Sam2VideoBackend, memory_fraction  # noqa: E402
 
 H, W = 8, 12
 
@@ -39,7 +39,14 @@ class FakeTensor:
         return self.a
 
 
+class FakeCuda:
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+
 class FakeTorch:
+    cuda = FakeCuda
+
     @staticmethod
     def inference_mode():
         return contextlib.nullcontext()
@@ -127,3 +134,37 @@ def test_state_is_reset_even_if_the_predictor_fails():
     with pytest.raises(RuntimeError, match="out of memory"):
         list(b.propagate_multi("/frames", 0, {1: prompt(2)}, threading.Event()))
     assert b._video_predictor.reset_called
+
+
+def test_init_state_failure_is_cleaned_up_without_touching_a_state_that_does_not_exist():
+    b = make_backend()
+
+    def boom(**kw):
+        raise FakeCuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    b._video_predictor.init_state = boom
+    with pytest.raises(FakeCuda.OutOfMemoryError):
+        list(b.propagate_multi("/frames", 0, {1: prompt(2)}, threading.Event()))
+    with pytest.raises(FakeCuda.OutOfMemoryError):
+        list(b.propagate("/frames", 0, prompt(2), threading.Event()))
+    assert not b._video_predictor.reset_called                           # nothing was created, nothing to reset
+    assert b._video_lock.acquire(blocking=False)                          # and the lock is free again
+
+
+def test_out_of_memory_classification():
+    b = make_backend()
+    assert b.is_out_of_memory(FakeCuda.OutOfMemoryError("CUDA out of memory"))
+    assert b.is_out_of_memory(RuntimeError("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate"))
+    assert not b.is_out_of_memory(RuntimeError("shape mismatch"))
+    assert not b.is_out_of_memory(ValueError("CUBLAS_STATUS_ALLOC_FAILED"))   # only RuntimeError counts
+
+
+def test_memory_cap_fraction():
+    gib = 2**30
+    assert memory_fraction(24, 48 * gib) == pytest.approx(0.5)
+    assert memory_fraction(21.5, 48 * gib) == pytest.approx(21.5 / 48)
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="must be > 0"):
+            memory_fraction(bad, 48 * gib)
+    with pytest.raises(ValueError, match="larger than the device"):
+        memory_fraction(64, 48 * gib)

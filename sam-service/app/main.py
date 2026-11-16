@@ -16,6 +16,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -28,8 +29,10 @@ from pydantic import BaseModel, Field, ValidationError
 
 from sam2common.polygon import mask_to_polygon, polygon_to_mask
 from sam2common.rle import cvat_points_to_mask, mask_to_cvat_points
+from sam2common.roi import MAX_LINES as MAX_ROI_LINES, Roi, RoiError
 
 from .cvat_frames import CvatClient, CvatError
+from .gpu_queue import FifoSlot, QueueFull, Ticket, TicketExpired
 from .backends import FakeBackend, Sam2ImageBackend, Sam2VideoBackend, SegmentationBackend
 
 MAX_PROPAGATION_FRAMES = int(os.environ.get("MAX_PROPAGATION_FRAMES", "600"))
@@ -37,6 +40,11 @@ CONSUMER_STALL_TIMEOUT_S = float(os.environ.get("CONSUMER_STALL_TIMEOUT_S", "120
 CVAT_INTERNAL_URL = os.environ.get("CVAT_INTERNAL_URL", "http://cvat_server:8080")
 MAX_OBJECTS = int(os.environ.get("MAX_OBJECTS", "8"))  # objects tracked together in one propagate-job call
 CVAT_HOST_HEADER = os.environ.get("CVAT_HOST_HEADER", "localhost")  # must be a valid domain name (no underscore)
+MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "8"))  # runs allowed to WAIT behind the running one (more -> HTTP 429)
+QUEUE_STALE_S = float(os.environ.get("QUEUE_STALE_S", "300"))  # a waiting request nobody polls for this long is dropped
+QUEUE_HEARTBEAT_S = float(os.environ.get("QUEUE_HEARTBEAT_S", "3"))  # {"queued": n} is repeated this often while waiting
+_limit = os.environ.get("GPU_MEMORY_LIMIT_GB", "").strip()
+GPU_MEMORY_LIMIT_GB = float(_limit) if _limit else None  # optional cap on PyTorch's GPU memory (emulate a smaller card)
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("sam2service")
@@ -54,6 +62,7 @@ def build_backend() -> SegmentationBackend:
             checkpoint=os.environ.get("SAM2_CHECKPOINT", "/checkpoints/sam2.1_hiera_large.pt"),
             device=os.environ.get("DEVICE", "cuda"),
             cache_size=cache,
+            memory_limit_gb=GPU_MEMORY_LIMIT_GB,
         )
     raise RuntimeError(f"Unknown SEG_BACKEND={kind!r}")
 
@@ -64,8 +73,9 @@ async def lifespan(app: FastAPI):
         app.state.backend = build_backend()
     if getattr(app.state, "cvat", None) is None:
         app.state.cvat = CvatClient(CVAT_INTERNAL_URL, host_header=CVAT_HOST_HEADER)
-    if getattr(app.state, "propagation_lock", None) is None:
-        app.state.propagation_lock = threading.Lock()  # one propagation at a time (see /v1/video/propagate)
+    if getattr(app.state, "gpu_queue", None) is None:
+        # ONE propagation runs at a time; the others wait here in arrival order (see _stream_propagation)
+        app.state.gpu_queue = FifoSlot(max_waiting=MAX_QUEUE, stale_s=QUEUE_STALE_S)
     log.info("Backend ready: %s", app.state.backend.name)
     yield
 
@@ -93,10 +103,14 @@ def healthz():
         "embedding_cache_misses": s.embedding_cache_misses,
         "propagations_run": s.propagations_run,
         "frames_propagated": s.frames_propagated,
-        "propagation_busy": app.state.propagation_lock.locked(),
+        "propagation_busy": app.state.gpu_queue.busy,
+        "queue_waiting": app.state.gpu_queue.waiting,
+        "queue_max": MAX_QUEUE,
+        "gpu": b.memory_info(),  # {} for backends without a GPU
         "max_propagation_frames": MAX_PROPAGATION_FRAMES,
         "max_objects": MAX_OBJECTS,
         "outputs": ["mask", "polygon"],  # formats /v1/video/propagate can produce (absent in older versions)
+        "roi_max_lines": MAX_ROI_LINES,  # region-of-interest support (absent in older versions)
     }
 
 
@@ -124,8 +138,10 @@ def interact(req: InteractRequest):
         res = app.state.backend.interact(key, get_image, req.pos_points, req.neg_points, box)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         log.exception("Inference failed")
+        if app.state.backend.is_out_of_memory(e):
+            raise HTTPException(503, "The GPU is out of memory; try again in a moment (a propagation may be running)")
         raise HTTPException(500, "Inference failed; see service logs")
 
     points = mask_to_cvat_points(res.mask)
@@ -141,6 +157,38 @@ class PropagateMeta(BaseModel):
     prompt_points: list[int]  # CVAT mask `points`: RLE of the bbox crop + [xtl, ytl, xbr, ybr]
     output: str = Field("mask", pattern="^(mask|polygon)$")  # per-frame result format
     simplify_px: float = Field(1.5, ge=0, le=20)  # polygon output: Douglas-Peucker tolerance in pixels
+    roi_lines: list[list[float]] | None = None  # region of interest, see sam2common/roi.py
+
+
+def _parse_roi(lines: list[list[float]] | None) -> Roi | None:
+    """None / [] = no region of interest. Invalid definitions are a 400 with the reason."""
+    if not lines:
+        return None
+    try:
+        return Roi(lines)
+    except RoiError as e:
+        raise HTTPException(400, f"Invalid ROI: {e}")
+
+
+def _check_prompts_inside(roi: Roi | None, prompts: dict[int, np.ndarray], single: bool) -> None:
+    """Refuse (400) when a prompt mask starts outside the region of interest: it would be dropped at once and
+    produce an empty track, which is never what the annotator wants. Nothing is changed in the job."""
+    if roi is None:
+        return
+    bad = []
+    for obj, mask in prompts.items():
+        c = Roi.centroid(mask)
+        line = None if c is None else roi.excluding_line(*c)
+        if line is not None:
+            bad.append((obj, line))
+    if not bad:
+        return
+    if single:
+        raise HTTPException(400, f"The prompt starts outside the region of interest (its centroid is on the excluded "
+                                 f"side of ROI line {bad[0][1]}); nothing to track")
+    detail = ", ".join(f"object {o} (line {ln})" for o, ln in bad)
+    raise HTTPException(400, f"{len(bad)} object(s) start outside the region of interest, centroid on the excluded "
+                             f"side of the given line: {detail}. Deselect them or fix the ROI; nothing was changed")
 
 
 def _ndjson(obj: dict) -> bytes:
@@ -156,7 +204,7 @@ def propagate(meta: str = Form(...), frames: list[UploadFile] = File(...)):
       {"frame": <index>, "points": <CVAT mask points | flat polygon [x1,y1,...]> | null}
       (null = object not found; for output="polygon" also when no usable contour exists)
     terminated by {"done": true, "frames": N} or, on failure, {"error": "..."}.
-    Only one propagation runs at a time; a concurrent request gets 429.
+    Only one propagation runs at a time; the others wait in a FIFO queue (see _stream_propagation).
     """
     backend: SegmentationBackend = app.state.backend
     try:
@@ -179,8 +227,11 @@ def propagate(meta: str = Form(...), frames: list[UploadFile] = File(...)):
         raise HTTPException(400, "prompt_points RLE is inconsistent with its bounding box")
     if not prompt_mask.any():
         raise HTTPException(400, "prompt mask is empty")
+    roi = _parse_roi(m.roi_lines)
+    _check_prompts_inside(roi, {1: prompt_mask}, single=True)
 
     # Persist the frames. JPEG only (what SAM 2's loader reads); sizes must match the prompt.
+    ticket = _join_queue()  # from here on EVERY exit path must give the ticket back
     tmpdir = tempfile.mkdtemp(prefix="sam2frames_")
     try:
         for i, f in enumerate(frames):
@@ -193,25 +244,50 @@ def propagate(meta: str = Form(...), frames: list[UploadFile] = File(...)):
                 out.write(data)
     except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        app.state.gpu_queue.leave(ticket)
         raise
 
-    return _stream_propagation(tmpdir, m.prompt_index, prompt_mask, m.output, m.simplify_px)
+    return _stream_propagation(tmpdir, m.prompt_index, prompt_mask, m.output, m.simplify_px, ticket=ticket, roi=roi)
+
+
+def _join_queue() -> Ticket:
+    """Take a place in the GPU queue, or refuse (HTTP 429) when too many runs already wait."""
+    try:
+        return app.state.gpu_queue.join()
+    except QueueFull as e:
+        raise HTTPException(429, f"The SAM 2 queue is full ({e}); try again in a moment")
 
 
 def _stream_propagation(tmpdir: str, prompt_index: int, prompt_mask: np.ndarray | None, output: str,
-                        simplify_px: float, prompts: dict[int, np.ndarray] | None = None) -> StreamingResponse:
+                        simplify_px: float, prompts: dict[int, np.ndarray] | None = None, *,
+                        ticket: Ticket, roi: Roi | None = None) -> StreamingResponse:
     """Run one propagation over the JPEG frames in `tmpdir` and stream NDJSON results. Takes ownership of
-    `tmpdir` (deleted on every exit path). One propagation at a time; a concurrent request gets 429.
-    With `prompts` (obj_id -> mask) several objects are tracked in one pass and every line carries "obj";
-    otherwise the single-object format is used (no "obj")."""
+    `tmpdir` and of `ticket` (both are released on every exit path). Only one propagation runs at a time: until
+    its turn comes the stream carries {"queued": n} lines (n = runs ahead; repeated as a heartbeat), then the
+    normal lines. With `prompts` (obj_id -> mask) several objects are tracked in one pass and every line carries
+    "obj"; otherwise the single-object format is used (no "obj"). With `roi`, an object whose mask centroid leaves
+    the region of interest is dropped for good: from that frame on its lines carry points=null (the client turns
+    them into "outside" markers, overwriting any older result), and the final line reports {"dropped": {obj: frame}}."""
     backend: SegmentationBackend = app.state.backend
-    lock: threading.Lock = app.state.propagation_lock
-    if not lock.acquire(blocking=False):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(429, "Another propagation is already running; retry when it has finished")
+    slot: FifoSlot = app.state.gpu_queue
+    n_frames = len([f for f in os.listdir(tmpdir) if f.endswith(".jpg")])
+    n_objects = len(prompts) if prompts is not None else 1
 
     q: queue.Queue = queue.Queue(maxsize=64)
     cancel = threading.Event()
+    dropped: dict[int, int] = {}  # obj id -> frame index (as in the stream) where it left the region of interest
+
+    def judge(obj: int, idx: int, mask: np.ndarray) -> np.ndarray | None:
+        """Region-of-interest rule: the mask, or None once the object has left the region (never comes back)."""
+        if roi is None:
+            return mask
+        if obj in dropped:
+            return None
+        if roi.mask_is_inside(mask) is False:  # None = empty mask = nothing to judge
+            dropped[obj] = idx
+            log.info("Object %d left the region of interest at frame %d", obj, idx)
+            return None
+        return mask
 
     def put(item) -> bool:
         waited = 0.0
@@ -237,42 +313,80 @@ def _stream_propagation(tmpdir: str, prompt_index: int, prompt_mask: np.ndarray 
                 for idx, mask in backend.propagate(tmpdir, prompt_index, prompt_mask, cancel):
                     if idx == prompt_index:
                         mask = prompt_mask  # on the prompt frame the user's own annotation is authoritative
-                    if not put({"frame": idx, "points": encode(mask)}):
+                    else:
+                        mask = judge(1, idx, mask)
+                    if not put({"frame": idx, "points": None if mask is None else encode(mask)}):
                         break  # consumer vanished
                     count += 1
                 else:
                     if not cancel.is_set():
                         final = {"done": True, "frames": count, "output": output}
+                        if roi is not None:
+                            final["roi_lines"] = len(roi)  # echo: lets a client detect a service that ignored the ROI
+                        if dropped:
+                            final["dropped"] = {str(o): f for o, f in dropped.items()}
             else:
                 frames_seen: set[int] = set()
                 for idx, obj, mask in backend.propagate_multi(tmpdir, prompt_index, prompts, cancel):
                     if idx == prompt_index:
                         mask = prompts[obj]  # the user's own annotation is authoritative on the prompt frame
-                    if not put({"frame": idx, "obj": obj, "points": encode(mask)}):
+                    else:
+                        mask = judge(obj, idx, mask)
+                    if not put({"frame": idx, "obj": obj, "points": None if mask is None else encode(mask)}):
                         break
                     frames_seen.add(idx)
                     count += 1
                 else:
                     if not cancel.is_set():
                         final = {"done": True, "frames": len(frames_seen), "objects": len(prompts), "output": output}
+                        if roi is not None:
+                            final["roi_lines"] = len(roi)  # echo: lets a client detect a service that ignored the ROI
+                        if dropped:
+                            final["dropped"] = {str(o): f for o, f in dropped.items()}
         except NotImplementedError as e:
             final = {"error": str(e)}
-        except Exception:  # noqa: BLE001
-            log.exception("Propagation failed after %d frames", count)
-            final = {"error": f"Propagation failed after {count} frames; see service logs"}
+        except Exception as e:  # noqa: BLE001
+            if backend.is_out_of_memory(e):
+                log.error("GPU out of memory after %d results (%d frames, %d objects)", count, n_frames, n_objects)
+                final = {"error": f"The GPU ran out of memory while tracking {n_objects} object(s) over {n_frames} "
+                                  "frames. Nothing was changed. Try fewer objects or a nearer end frame."}
+            else:
+                log.exception("Propagation failed after %d frames", count)
+                final = {"error": f"Propagation failed after {count} frames; see service logs"}
         finally:
             # Release everything BEFORE announcing the end of the stream: a client that starts its next
-            # propagation the moment it sees `done` / `error` must never get a spurious 429.
+            # propagation the moment it sees `done` / `error` must never be refused or made to wait for nothing.
             shutil.rmtree(tmpdir, ignore_errors=True)
-            lock.release()
+            slot.leave(ticket)
         if final is not None:
             put(final)
 
     thread = threading.Thread(target=worker, name="propagation", daemon=True)
-    thread.start()
 
     def stream():
+        started = False
         try:
+            # --- waiting for the GPU slot (the first check is instant, so an idle service sends no queue lines)
+            last_pos: int | None = None
+            last_sent = 0.0
+            while True:
+                pos = 0
+                try:
+                    got = slot.wait_turn(ticket, 0.0 if last_pos is None else 1.0)
+                    if not got:
+                        pos = slot.position(ticket)
+                except TicketExpired:
+                    yield _ndjson({"error": "Waited too long in the queue; please run again"})
+                    return
+                if got:
+                    break
+                now = time.monotonic()
+                if pos != last_pos or now - last_sent >= QUEUE_HEARTBEAT_S:
+                    last_pos, last_sent = pos, now
+                    yield _ndjson({"queued": pos})  # also how a vanished client is noticed while waiting
+            # --- we hold the slot: run
+            thread.start()
+            started = True
             while True:
                 try:
                     item = q.get(timeout=5)
@@ -285,6 +399,9 @@ def _stream_propagation(tmpdir: str, prompt_index: int, prompt_mask: np.ndarray 
                     return
         finally:
             cancel.set()  # client went away (or finished): make the worker stop and clean up
+            if not started:  # never ran: the worker will not do the cleanup
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                slot.leave(ticket)
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -307,6 +424,7 @@ class PropagateJobRequest(BaseModel):
     objects: list[PromptObject] | None = None
     output: str = Field("mask", pattern="^(mask|polygon)$")
     simplify_px: float = Field(1.5, ge=0, le=20)
+    roi_lines: list[list[float]] | None = None  # region of interest, see sam2common/roi.py
 
 
 def _to_jpeg(raw: bytes) -> tuple[bytes, tuple[int, int]]:
@@ -335,20 +453,7 @@ def propagate_job(req: PropagateJobRequest, request: Request):
     if n > MAX_PROPAGATION_FRAMES:
         raise HTTPException(400, f"{n} frames exceed the limit of {MAX_PROPAGATION_FRAMES}; choose a nearer end frame")
 
-    def fetch(frame: int) -> tuple[bytes, tuple[int, int]]:
-        return _to_jpeg(cvat.fetch_frame(headers, req.job_id, frame, req.org))
-
-    try:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            frames = list(pool.map(fetch, range(req.from_frame, req.to_frame + 1)))
-    except CvatError as e:
-        raise HTTPException(e.status, str(e))
-    except Exception as e:  # noqa: BLE001  (undecodable image etc.)
-        raise HTTPException(502, f"Could not read a frame from CVAT: {type(e).__name__}: {e}")
-    width, height = frames[0][1]
-    if any(sz != (width, height) for _, sz in frames):
-        raise HTTPException(400, "Frames in the range have different sizes")
-
+    # Request-shape checks first (cheap): nothing is downloaded and no queue place is taken for a bad request.
     single = req.prompt_type is not None or req.prompt_points is not None
     if single == (req.objects is not None):
         raise HTTPException(400, "Give either prompt_type + prompt_points, or objects")
@@ -361,33 +466,58 @@ def propagate_job(req: PropagateJobRequest, request: Request):
         if len(set(ids)) != len(ids):
             raise HTTPException(400, "Object ids must be unique")
 
-    def to_mask(kind: str, points: list[float], who: str) -> np.ndarray:
-        try:
-            if kind == "mask":
-                m = cvat_points_to_mask([int(round(v)) for v in points], height, width)
-            else:
-                if len(points) < 6 or len(points) % 2:
-                    raise ValueError("a polygon needs an even number of coordinates, at least 6")
-                m = polygon_to_mask(points, height, width)
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"Invalid prompt{who} for {width}x{height} frames: {e}")
-        if not m.any():
-            raise HTTPException(400, f"The prompt{who} is empty at this frame size")
-        return m
+    roi = _parse_roi(req.roi_lines)
 
-    prompt_mask = None
-    prompts: dict[int, np.ndarray] | None = None
-    if req.objects is None:
-        prompt_mask = to_mask(req.prompt_type, req.prompt_points, "")
-    else:
-        prompts = {o.id: to_mask(o.prompt_type, o.prompt_points, f" of object {o.id}") for o in req.objects}
+    def fetch(frame: int) -> tuple[bytes, tuple[int, int]]:
+        return _to_jpeg(cvat.fetch_frame(headers, req.job_id, frame, req.org))
 
-    tmpdir = tempfile.mkdtemp(prefix="sam2frames_")
+    # Take a place in the GPU queue BEFORE downloading, so the frames of a waiting run are fetched while the GPU
+    # is busy with the run ahead of it. From here on EVERY exit path must give the ticket back.
+    ticket = _join_queue()
+    tmpdir: str | None = None
     try:
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                frames = list(pool.map(fetch, range(req.from_frame, req.to_frame + 1)))
+        except CvatError as e:
+            raise HTTPException(e.status, str(e))
+        except Exception as e:  # noqa: BLE001  (undecodable image etc.)
+            raise HTTPException(502, f"Could not read a frame from CVAT: {type(e).__name__}: {e}")
+        width, height = frames[0][1]
+        if any(sz != (width, height) for _, sz in frames):
+            raise HTTPException(400, "Frames in the range have different sizes")
+
+        def to_mask(kind: str, points: list[float], who: str) -> np.ndarray:
+            try:
+                if kind == "mask":
+                    m = cvat_points_to_mask([int(round(v)) for v in points], height, width)
+                else:
+                    if len(points) < 6 or len(points) % 2:
+                        raise ValueError("a polygon needs an even number of coordinates, at least 6")
+                    m = polygon_to_mask(points, height, width)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(400, f"Invalid prompt{who} for {width}x{height} frames: {e}")
+            if not m.any():
+                raise HTTPException(400, f"The prompt{who} is empty at this frame size")
+            return m
+
+        prompt_mask = None
+        prompts: dict[int, np.ndarray] | None = None
+        if req.objects is None:
+            prompt_mask = to_mask(req.prompt_type, req.prompt_points, "")
+            _check_prompts_inside(roi, {1: prompt_mask}, single=True)
+        else:
+            prompts = {o.id: to_mask(o.prompt_type, o.prompt_points, f" of object {o.id}") for o in req.objects}
+            _check_prompts_inside(roi, prompts, single=False)
+
+        tmpdir = tempfile.mkdtemp(prefix="sam2frames_")
         for i, (data, _) in enumerate(frames):
             with open(os.path.join(tmpdir, f"{i:05d}.jpg"), "wb") as out:
                 out.write(data)
+        frames = []  # free the encoded copies; they are on disk now
+        return _stream_propagation(tmpdir, 0, prompt_mask, req.output, req.simplify_px, prompts, ticket=ticket, roi=roi)
     except BaseException:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        app.state.gpu_queue.leave(ticket)
         raise
-    return _stream_propagation(tmpdir, 0, prompt_mask, req.output, req.simplify_px, prompts)

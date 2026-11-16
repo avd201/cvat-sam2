@@ -10,6 +10,7 @@ import InputNumber from 'antd/lib/input-number';
 import Progress from 'antd/lib/progress';
 import Alert from 'antd/lib/alert';
 import Button from 'antd/lib/button';
+import Checkbox from 'antd/lib/checkbox';
 import { OutputKind } from './plan';
 
 export interface RunConfig {
@@ -18,7 +19,8 @@ export interface RunConfig {
     targetGroup: number | null; // mask output: join this existing object instead of the selected mask's own one
 }
 
-export type ProgressReporter = (phase: 'propagating' | 'applying', done: number, total: number) => void;
+// 'queued': waiting for the GPU behind other runs; `done` = how many runs are ahead (total is unused)
+export type ProgressReporter = (phase: 'queued' | 'propagating' | 'applying', done: number, total: number) => void;
 
 export interface ObjectChoice {
     id: number;
@@ -28,6 +30,7 @@ export interface ObjectChoice {
 export interface DialogProps {
     objectLines: string[]; // one line per selected object
     objectCount: number;
+    roiLines?: number; // number of region-of-interest lines found in the job (0/undefined = none)
     fromFrame: number;
     stopFrame: number;
     outputs: OutputKind[];
@@ -45,18 +48,19 @@ const OUTPUT_LABELS: Record<OutputKind, string> = {
 
 export default function Sam2Dialog(props: DialogProps): JSX.Element {
     const {
-        objectLines, objectCount, fromFrame, stopFrame, outputs, ownGroup, choices, suggested, run, onClose,
+        objectLines, objectCount, roiLines, fromFrame, stopFrame, outputs, ownGroup, choices, suggested, run, onClose,
     } = props;
     const [toFrame, setToFrame] = useState<number>(Math.min(fromFrame + 30, stopFrame));
     const [output, setOutput] = useState<OutputKind>(outputs[0]);
     // 0 = the selected mask's own object (or a new one if it has none); otherwise an existing object's id
     const [target, setTarget] = useState<number>(ownGroup ? 0 : (suggested ?? 0));
-    const [phase, setPhase] = useState<'config' | 'propagating' | 'applying' | 'done' | 'error'>('config');
+    const [phase, setPhase] = useState<'config' | 'queued' | 'propagating' | 'applying' | 'done' | 'error'>('config');
     const [progress, setProgress] = useState<{ done: number; total: number }>({ done: 0, total: 1 });
+    const [ahead, setAhead] = useState<number>(0);
     const [message, setMessage] = useState<string>('');
     const abort = useRef<AbortController | null>(null);
 
-    const busy = phase === 'propagating' || phase === 'applying';
+    const busy = phase === 'queued' || phase === 'propagating' || phase === 'applying';
     const locked = busy || phase === 'done';
     const valid = Number.isInteger(toFrame) && toFrame > fromFrame && toFrame <= stopFrame;
     const showObjectChoice = output === 'mask' && choices.length > 0;
@@ -72,7 +76,8 @@ export default function Sam2Dialog(props: DialogProps): JSX.Element {
                 toFrame, output, targetGroup: output === 'mask' && target ? target : null,
             }, (p, done, total) => {
                 setPhase(p);
-                setProgress({ done, total });
+                if (p === 'queued') setAhead(done);
+                else setProgress({ done, total });
             }, controller.signal);
             setMessage(summary);
             setPhase('done');
@@ -105,6 +110,17 @@ export default function Sam2Dialog(props: DialogProps): JSX.Element {
             ]}
         >
             <ObjectList lines={objectLines} />
+            {roiLines ? (
+                <p>
+                    Region of interest:
+                    {' '}
+                    <b>{roiLines}</b>
+                    {' '}
+                    {roiLines === 1 ? 'line' : 'lines'}
+                    {' '}
+                    (polylines labelled roi_line). An object is dropped for good when its centroid leaves the region.
+                </p>
+            ) : null}
             <p>
                 Starting from frame
                 {' '}
@@ -166,9 +182,12 @@ export default function Sam2Dialog(props: DialogProps): JSX.Element {
                 <div style={{ marginTop: 12 }}>
                     <Progress percent={Math.round((100 * progress.done) / Math.max(progress.total, 1))} status='active' />
                     <div>
-                        {phase === 'applying'
-                            ? 'Writing results into the job…'
-                            : `Tracking ${objectCount > 1 ? `${objectCount} objects` : 'the object'} with SAM 2…`}
+                        {phase === 'applying' && 'Writing results into the job…'}
+                        {phase === 'queued' && (
+                            `Waiting for the GPU: ${ahead} propagation${ahead === 1 ? ' is' : 's are'} ahead of this one…`
+                        )}
+                        {phase === 'propagating'
+                            && `Tracking ${objectCount > 1 ? `${objectCount} objects` : 'the object'} with SAM 2…`}
                     </div>
                 </div>
             ) : null}
@@ -267,6 +286,78 @@ export function DeleteDialog(props: DeleteDialogProps): JSX.Element {
             {phase === 'done' ? (
                 <Alert type='success' showIcon message={<span style={{ whiteSpace: 'pre-line' }}>{message}</span>} description='Press Ctrl+S to save the job.' />
             ) : null}
+            {phase === 'error' ? <Alert type='error' showIcon message={message} /> : null}
+        </Modal>
+    );
+}
+
+
+export function BoxDialog(props: {
+    objectLines: string[];
+    run: (replaceOriginals: boolean, report: (done: number, total: number) => void, signal: AbortSignal) => Promise<string>;
+    onClose: () => void;
+}): JSX.Element {
+    const { objectLines, run, onClose } = props;
+    const [phase, setPhase] = useState<'config' | 'running' | 'done' | 'error'>('config');
+    const [message, setMessage] = useState('');
+    const [percent, setPercent] = useState(0);
+    const [replaceOriginals, setReplaceOriginals] = useState(false);
+    const abort = useRef<AbortController | null>(null);
+    const busy = phase === 'running';
+    const close = (): void => {
+        if (busy) abort.current?.abort();
+        else onClose();
+    };
+    const go = async (): Promise<void> => {
+        const controller = new AbortController();
+        abort.current = controller;
+        setPhase('running');
+        setPercent(0);
+        try {
+            setMessage(await run(replaceOriginals, (done, total) => setPercent(Math.round(100 * done / total)), controller.signal));
+            setPhase('done');
+        } catch (error) {
+            setMessage((error as Error).message);
+            setPhase('error');
+        }
+    };
+    return (
+        <Modal
+            open
+            title='SAM 2: convert to box tracks'
+            onCancel={close}
+            maskClosable={false}
+            footer={[
+                <Button key='close' onClick={close}>{busy ? 'Cancel' : 'Close'}</Button>,
+                phase === 'config' ? (
+                    <Button key='convert' type='primary' onClick={go}>Create box tracks</Button>
+                ) : null,
+            ]}
+        >
+            <ObjectList lines={objectLines} />
+            <p>
+                Create tight axis-aligned boxes with no margin over each selected object’s full duration in this job.
+                Polygon tracks are evaluated on every frame. A grouped mask selects all masks in its group;
+                an ungrouped mask creates a one-frame track. Missing masks remain gaps.
+            </p>
+            <p>
+                Boxes receive new CVAT track IDs and keep the source label and group.
+                Labels, attributes and occlusion flags are carried over. Run this once per object to avoid duplicate boxes.
+            </p>
+            <Checkbox
+                checked={replaceOriginals}
+                disabled={phase !== 'config'}
+                onChange={(event) => setReplaceOriginals(event.target.checked)}
+            >
+                Replace originals
+            </Checkbox>
+            <p style={{ marginTop: 8 }}>
+                {replaceOriginals
+                    ? 'After creating the boxes, remove the selected polygon tracks and all masks of the selected groups in this job. Changes take effect when you save.'
+                    : 'Keep the original polygons and masks alongside the new box tracks.'}
+            </p>
+            {busy ? <Progress percent={percent} status='active' /> : null}
+            {phase === 'done' ? <Alert type='success' showIcon message={message} /> : null}
             {phase === 'error' ? <Alert type='error' showIcon message={message} /> : null}
         </Modal>
     );

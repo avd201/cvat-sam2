@@ -6,6 +6,7 @@ import Collection from '../../../../../cvat-core/src/annotations-collection';
 import AnnotationHistory from '../../../../../cvat-core/src/annotations-history';
 import { Label } from '../../../../../cvat-core/src/labels';
 import { applyResults, deleteForward } from '../../src/ts/apply';
+import { planBoxTracks, importBoxTracks, tightBox, convertToBoxTracks } from '../../src/ts/boxes';
 
 const STOP = 20;
 const W = 200;
@@ -28,6 +29,7 @@ function makeJob(): { job: any; c: Collection } {
     });
     // Mirrors the Job.annotations implementations in cvat-core/src/session-implementation.ts
     const job = {
+        startFrame: 0,
         stopFrame: STOP,
         annotations: {
             get: async (f: number, all: boolean, filters: object[]) => c.get(f, all, filters),
@@ -355,6 +357,163 @@ async function scenarioMixedTrackAndShape(): Promise<void> {
     console.log('  track + mask mixed : in-place update, new polygon track, multi delete-forward ok');
 }
 
+// Semantic snapshots deliberately exclude keyframe/link bookkeeping: preserving an interpolated
+// frame may require making it explicit, but its geometry and annotation metadata must stay identical.
+const retainedState = (st: any) => ({
+    points: st.points, outside: st.outside, occluded: st.occluded, zOrder: st.zOrder,
+    rotation: st.rotation, attributes: st.attributes, label: st.label.id, group: st.group.id,
+    clientID: st.clientID, serverID: st.serverID,
+});
+
+async function scenarioRetainedInterpolation(): Promise<void> {
+    const failures: Error[] = [];
+    let cases = 0;
+    for (const geometry of ['translated', 'unequal-vertices', 'gap', 'dense']) {
+        for (const operation of ['delete-current', 'delete-later', 'repropagate']) {
+            for (const prompt of [1, 5, 10, 20]) {
+                const name = `${geometry}/${operation}/frame-${prompt}`;
+                try {
+                    const { job, c } = makeJob();
+                    const shape = (frame: number, points: number[], outside = false) => ({
+                        type: 'polygon', frame, points, outside, occluded: frame >= 10,
+                        z_order: frame >= 10 ? 4 : 2, rotation: 0,
+                        attributes: [{ spec_id: 2, value: frame >= 10 ? 'sitting' : 'standing' }],
+                    });
+                    let shapes = [shape(0, polyAt(10)), shape(10, polyAt(110))];
+                    if (geometry === 'unequal-vertices') {
+                        shapes = [shape(0, [10, 10, 55, 20, 20, 70]),
+                            shape(10, [80, 15, 140, 10, 165, 35, 135, 80, 75, 65])];
+                    } else if (geometry === 'gap') {
+                        shapes = [shape(0, polyAt(10)), shape(3, polyAt(40), true),
+                            shape(10, polyAt(110)), shape(15, polyAt(120), true)];
+                    } else if (geometry === 'dense') {
+                        shapes = Array.from({ length: 11 }, (_, f) => shape(f, polyAt(10 + 10 * f)));
+                    }
+                    c.import({ tracks: [{ id: 91, frame: 0, label_id: 1, group: 3, source: 'manual',
+                        attributes: [{ spec_id: 1, value: 'brown' }], shapes },
+                    { id: 92, frame: 0, label_id: 1, group: 4, source: 'manual', attributes: [],
+                        shapes: [shape(0, polyAt(160)), shape(10, polyAt(170))] }] } as any);
+                    const id = stateAt(c, 0, (s) => s.serverID === 91).clientID;
+                    const otherBefore = JSON.stringify(c.export().tracks.find((t) => t.id === 92));
+                    const boundary = operation === 'delete-current' ? prompt - 1 : prompt;
+                    const before = Array.from({ length: boundary + 1 }, (_, f) =>
+                        retainedState(stateAt(c, f, (s) => s.clientID === id)));
+                    const state = stateAt(c, prompt, (s) => s.clientID === id);
+                    if (operation === 'repropagate') {
+                        const toFrame = Math.min(prompt + 4, STOP);
+                        const results = new Map<number, number[] | null>([[prompt, null]]);
+                        for (let f = prompt + 1; f <= toFrame; f++) {
+                            results.set(f, f === prompt + 2 ? null : polyAt(70 + f));
+                        }
+                        await applyResults({ job, state, fromFrame: prompt, toFrame, stopFrame: STOP,
+                            results, output: 'polygon' });
+                        for (const [f, points] of results) {
+                            if (f === prompt) continue;
+                            const st = stateAt(c, f, (s) => s.clientID === id);
+                            assert.equal(st.outside, points === null, `${name}: result visibility on ${f}`);
+                            if (points) assert.deepEqual(st.points, points, `${name}: new result on ${f}`);
+                        }
+                    } else {
+                        const cut = operation === 'delete-current' ? prompt : prompt + 1;
+                        await deleteForward({ job, state, frame: prompt, stopFrame: STOP,
+                            includeCurrent: operation === 'delete-current' });
+                        for (let f = cut; f <= STOP; f++) {
+                            assert.equal(stateAt(c, f, (s) => s.clientID === id).outside, true,
+                                `${name}: ended on ${f}`);
+                        }
+                    }
+                    for (let f = 0; f <= boundary; f++) {
+                        assert.deepEqual(retainedState(stateAt(c, f, (s) => s.clientID === id)), before[f],
+                            `${name}: retained frame ${f}`);
+                    }
+                    assert.equal(JSON.stringify(c.export().tracks.find((t) => t.id === 92)), otherBefore,
+                        `${name}: unrelated track unchanged`);
+                    const fresh = makeJob();
+                    fresh.c.import(c.export());
+                    for (let f = 0; f <= boundary; f++) {
+                        const st = retainedState(stateAt(fresh.c, f, (s) => s.serverID === 91));
+                        assert.deepEqual({ ...st, clientID: before[f].clientID }, before[f],
+                            `${name}: retained frame ${f} after export/reimport`);
+                    }
+                    cases++;
+                } catch (error) {
+                    console.error(`  REGRESSION FAILED: ${name}: ${(error as Error).message}`);
+                    failures.push(error as Error);
+                }
+            }
+        }
+    }
+    if (failures.length) throw new AggregateError(failures, `${failures.length} retained-interpolation cases failed`);
+    console.log(`  retained interpolation: ${cases} cases; all retained frames, metadata, identity and round-trip ok`);
+}
+
+async function scenarioTightBoxes(): Promise<void> {
+    const { job, c } = makeJob();
+    c.import({ tracks: [{
+        id: 77, label_id: 1, group: 0, source: 'manual', frame: 2,
+        attributes: [{ spec_id: 1, value: 'brown' }],
+        shapes: [
+            { type: 'polygon', frame: 2, points: polyAt(10), outside: false, occluded: false, z_order: 2, rotation: 0, attributes: [{ spec_id: 2, value: 'standing' }] },
+            { type: 'polygon', frame: 6, points: polyAt(30), outside: false, occluded: true, z_order: 2, rotation: 0, attributes: [{ spec_id: 2, value: 'sitting' }] },
+            { type: 'polygon', frame: 7, points: polyAt(30), outside: true, occluded: false, z_order: 2, rotation: 0, attributes: [] },
+            { type: 'polygon', frame: 9, points: polyAt(40), outside: false, occluded: false, z_order: 2, rotation: 0, attributes: [] },
+            { type: 'polygon', frame: 10, points: polyAt(40), outside: true, occluded: false, z_order: 2, rotation: 0, attributes: [] },
+        ],
+    }], shapes: [1, 2, 4].map((frame) => ({
+        type: 'mask', frame, label_id: 1, group: 12, source: 'manual', points: maskAt(50 + frame),
+        outside: false, occluded: frame === 4, z_order: 3, rotation: 0,
+        attributes: [{ spec_id: 1, value: 'white' }, { spec_id: 2, value: `pose-${frame}` }],
+    })) } as any);
+    const before = JSON.stringify(c.export());
+    const selected = c.get(2, false, []);
+    const tracks = await planBoxTracks(job, selected as any);
+    assert.equal(JSON.stringify(c.export()), before, 'planning left all originals unchanged');
+    assert.equal(tracks.length, 2);
+    await importBoxTracks(job, tracks);
+    for (let frame = 0; frame <= STOP; frame++) {
+        const states = c.get(frame, true, []) as any[];
+        const polygon = states.find((st) => st.shapeType === 'polygon');
+        const polygonBox = states.find((st) => st.shapeType === 'rectangle' && st.group.id === 0);
+        if (polygon && frame >= 2 && !polygon.outside) {
+            assert.equal(polygonBox.outside, false);
+            assert.deepEqual(polygonBox.points, tightBox('polygon', polygon.points), `tight at interpolated frame ${frame}`);
+            assert.deepEqual(polygonBox.attributes, polygon.attributes);
+            assert.equal(polygonBox.occluded, polygon.occluded);
+            assert.notEqual(polygonBox.clientID, polygon.clientID);
+        } else assert.ok(!polygonBox || polygonBox.outside, `polygon gap preserved on ${frame}`);
+        const mask = states.find((st) => st.shapeType === 'mask');
+        const maskBox = states.find((st) => st.shapeType === 'rectangle' && st.group.id === 12);
+        if (mask) {
+            assert.deepEqual(maskBox.points, [50 + frame, 20, 60 + frame, 30]);
+            assert.deepEqual(maskBox.attributes, mask.attributes);
+            assert.equal(maskBox.occluded, mask.occluded);
+        } else assert.ok(!maskBox || maskBox.outside, `mask gap preserved on ${frame}`);
+    }
+    const exported = c.export();
+    assert.equal(exported.tracks.find((t) => t.id === 77).shapes[0].type, 'polygon');
+    const fresh = makeJob();
+    fresh.c.import(exported);
+    assert.deepEqual((fresh.c.get(3, false, []) as any[]).find((st) => st.shapeType === 'rectangle').points,
+        tracks[0].shapes.find((st) => st.frame === 3).points, 'round-trip keeps interpolated-frame bounds');
+    const unrelated = {
+        type: 'mask', frame: 2, label_id: 1, group: 13, source: 'manual', points: maskAt(90),
+        outside: false, occluded: false, z_order: 0, rotation: 0, attributes: [],
+    };
+    c.import({ shapes: [unrelated] } as any);
+    await convertToBoxTracks(job, selected as any, true);
+    const replaced = c.export();
+    assert.equal(replaced.tracks.length, 4, 'earlier boxes are kept, replacement creates two new box tracks');
+    assert.ok(replaced.tracks.every((t) => t.shapes.every((shape) => shape.type === 'rectangle')),
+        'the selected polygon track is removed in full');
+    assert.equal(replaced.shapes.length, 1, 'every mask in the selected group was removed, including other frames');
+    assert.equal(replaced.shapes[0].group, 13, 'unselected mask group is preserved');
+    const reloaded = makeJob();
+    reloaded.c.import(replaced);
+    assert.equal(reloaded.c.export().tracks.length, 4);
+    assert.equal(reloaded.c.export().shapes.length, 1);
+    console.log('  tight box conversion: interpolation, gaps, keep/replace, unrelated objects and round-trip ok');
+}
+
 (async () => {
     console.log('cvat-core harness:');
     await scenarioMaskRepropagation();
@@ -368,5 +527,7 @@ async function scenarioMixedTrackAndShape(): Promise<void> {
     await scenarioAttributesCarried();
     await scenarioTwoMaskObjects();
     await scenarioMixedTrackAndShape();
+    await scenarioTightBoxes();
+    await scenarioRetainedInterpolation();
     console.log('ALL SCENARIOS PASSED');
 })().catch((e) => { console.error('HARNESS FAILURE:', e); process.exit(1); });

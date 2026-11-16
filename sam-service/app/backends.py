@@ -82,11 +82,35 @@ class SegmentationBackend(abc.ABC):
                 yield idx, obj_id, out
 
 
+    def is_out_of_memory(self, exc: BaseException) -> bool:
+        """True if `exc` means the accelerator ran out of memory (so the HTTP layer can say so clearly)."""
+        return False
+
+    def memory_info(self) -> dict:
+        """Accelerator memory figures for /healthz (empty if the backend has none)."""
+        return {}
+
+
+def memory_fraction(limit_gb: float, total_bytes: int) -> float:
+    """Fraction of the device memory that `limit_gb` GiB represents (for torch.cuda.set_per_process_memory_fraction).
+    Refuses nonsense instead of silently ignoring it: a cap that is <= 0 or larger than the device is a typo."""
+    if limit_gb <= 0:
+        raise ValueError(f"GPU_MEMORY_LIMIT_GB must be > 0, got {limit_gb}")
+    total_gb = total_bytes / 2**30
+    if limit_gb > total_gb:
+        raise ValueError(f"GPU_MEMORY_LIMIT_GB={limit_gb} is larger than the device memory ({total_gb:.1f} GiB)")
+    return limit_gb / total_gb
+
+
 def _validate(pos_points, neg_points, box) -> None:
     if not pos_points and not neg_points and box is None:
         raise ValueError("At least one prompt (point or box) is required")
     if not pos_points and box is None:
         raise ValueError("Negative points alone are not a valid prompt: add a positive point or a box")
+
+
+class SimulatedOutOfMemory(RuntimeError):
+    """Stand-in for torch.cuda.OutOfMemoryError in tests."""
 
 
 class FakeBackend(SegmentationBackend):
@@ -100,10 +124,16 @@ class FakeBackend(SegmentationBackend):
         super().__init__()
         self.stats.model_loads = 1  # "loading" happens exactly once, at construction
         self.fail_at_frame = fail_at_frame  # tests: raise when this frame index is reached
+        self.oom_at_frame: int | None = None  # tests: raise SimulatedOutOfMemory when this frame index is reached
+        self.hold: threading.Event | None = None  # tests: a run blocks (holding the slot) until this is set
+        self.runs_started = 0
         self.last_frames_dir: str | None = None
         self._cache: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._cache_size = cache_size
         self._lock = threading.Lock()
+
+    def is_out_of_memory(self, exc):
+        return isinstance(exc, SimulatedOutOfMemory)
 
     def interact(self, image_key, get_image, pos_points, neg_points, box):
         _validate(pos_points, neg_points, box)
@@ -139,11 +169,16 @@ class FakeBackend(SegmentationBackend):
         n = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
         h, w = prompt_mask.shape
         self.stats.propagations_run += 1
+        self.runs_started += 1
+        if self.hold is not None:
+            self.hold.wait(timeout=20)
         for idx in range(prompt_index, n):
             if cancel.is_set():
                 return
             if self.fail_at_frame is not None and idx == self.fail_at_frame:
                 raise RuntimeError("simulated inference failure")
+            if self.oom_at_frame is not None and idx == self.oom_at_frame:
+                raise SimulatedOutOfMemory("simulated CUDA out of memory")
             shift = (idx - prompt_index) * 2
             out = np.zeros_like(prompt_mask)
             if shift < w:
@@ -164,7 +199,8 @@ class Sam2ImageBackend(SegmentationBackend):
 
     name = "sam2-image"
 
-    def __init__(self, config: str, checkpoint: str, device: str = "cuda", cache_size: int = 4) -> None:
+    def __init__(self, config: str, checkpoint: str, device: str = "cuda", cache_size: int = 4,
+                 memory_limit_gb: float | None = None) -> None:
         super().__init__()
         import torch
         from sam2.build_sam import build_sam2
@@ -172,6 +208,17 @@ class Sam2ImageBackend(SegmentationBackend):
 
         self._torch = torch
         self._device = device
+        self._memory_limit_gb = memory_limit_gb
+        if memory_limit_gb is not None:
+            if not device.startswith("cuda"):
+                raise ValueError("GPU_MEMORY_LIMIT_GB only makes sense with DEVICE=cuda")
+            # Caps PyTorch's caching allocator (weights, activations, SAM 2 memory bank). It does NOT cover the
+            # CUDA context (~0.5 GB), which nvidia-smi adds on top. Allocations beyond the cap raise
+            # torch.cuda.OutOfMemoryError, exactly as on a smaller card.
+            idx = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(idx).total_memory
+            torch.cuda.set_per_process_memory_fraction(memory_fraction(memory_limit_gb, total), idx)
+            log.info("GPU memory cap: %.1f GiB of %.1f GiB (PyTorch allocator only)", memory_limit_gb, total / 2**30)
         log.info("Loading SAM 2: config=%s checkpoint=%s device=%s", config, checkpoint, device)
         model = build_sam2(config, checkpoint, device=device)
         self._predictor = SAM2ImagePredictor(model)
@@ -179,6 +226,42 @@ class Sam2ImageBackend(SegmentationBackend):
         self._cache: OrderedDict[str, dict] = OrderedDict()
         self._cache_size = cache_size
         self._lock = threading.Lock()  # one GPU job at a time
+
+    def is_out_of_memory(self, exc):
+        if isinstance(exc, self._torch.cuda.OutOfMemoryError):
+            return True
+        # cuBLAS reports allocation failures as a plain RuntimeError
+        return isinstance(exc, RuntimeError) and "CUBLAS_STATUS_ALLOC_FAILED" in str(exc)
+
+    def memory_info(self) -> dict:
+        if not self._device.startswith("cuda"):
+            return {}
+        t = self._torch.cuda
+        mib = 2**20
+        idx = t.current_device()
+        return {
+            "device": t.get_device_name(idx),
+            "total_mib": round(t.get_device_properties(idx).total_memory / mib),
+            "allocated_mib": round(t.memory_allocated(idx) / mib),
+            "reserved_mib": round(t.memory_reserved(idx) / mib),
+            "peak_allocated_mib": round(t.max_memory_allocated(idx) / mib),  # since the last propagation began
+            "limit_gib": self._memory_limit_gb,
+        }
+
+    def _begin_run(self) -> float:
+        """Reset the peak counter; returns the allocated MiB at the start (weights etc.)."""
+        if not self._device.startswith("cuda"):
+            return 0.0
+        self._torch.cuda.reset_peak_memory_stats()
+        return self._torch.cuda.memory_allocated() / 2**20
+
+    def _end_run(self, state, n_objects: int, start_mib: float) -> None:
+        if not self._device.startswith("cuda"):
+            return
+        peak = self._torch.cuda.max_memory_allocated() / 2**20
+        frames = state.get("num_frames") if isinstance(state, dict) else None
+        log.info("Propagation finished: frames=%s objects=%d allocated_at_start=%.0f MiB peak=%.0f MiB (+%.0f MiB)",
+                 frames, n_objects, start_mib, peak, peak - start_mib)
 
     def _autocast(self):
         if self._device.startswith("cuda"):
@@ -235,8 +318,9 @@ class Sam2VideoBackend(Sam2ImageBackend):
 
     name = "sam2"
 
-    def __init__(self, config: str, checkpoint: str, device: str = "cuda", cache_size: int = 4) -> None:
-        super().__init__(config, checkpoint, device, cache_size)
+    def __init__(self, config: str, checkpoint: str, device: str = "cuda", cache_size: int = 4,
+                 memory_limit_gb: float | None = None) -> None:
+        super().__init__(config, checkpoint, device, cache_size, memory_limit_gb)
         from sam2.build_sam import build_sam2_video_predictor
 
         torch = self._torch
@@ -253,13 +337,15 @@ class Sam2VideoBackend(Sam2ImageBackend):
         torch, vp = self._torch, self._video_predictor
         with self._video_lock, torch.inference_mode(), self._autocast():
             self.stats.propagations_run += 1
-            state = vp.init_state(
-                video_path=frames_dir,
-                offload_video_to_cpu=True,  # frames stay in CPU RAM; GPU holds only memory features
-                offload_state_to_cpu=False,
-                async_loading_frames=False,
-            )
+            start_mib = self._begin_run()
+            state = None  # set inside the try so that a failure in init_state (e.g. out of memory) is cleaned up too
             try:
+                state = vp.init_state(
+                    video_path=frames_dir,
+                    offload_video_to_cpu=True,  # frames stay in CPU RAM; GPU holds only memory features
+                    offload_state_to_cpu=False,
+                    async_loading_frames=False,
+                )
                 vp.add_new_mask(state, frame_idx=prompt_index, obj_id=1, mask=torch.from_numpy(prompt_mask))
                 for idx, _obj_ids, logits in vp.propagate_in_video(state, start_frame_idx=prompt_index):
                     if cancel.is_set():
@@ -267,8 +353,10 @@ class Sam2VideoBackend(Sam2ImageBackend):
                     self.stats.frames_propagated += 1
                     yield idx, (logits[0, 0] > 0.0).cpu().numpy()
             finally:
-                vp.reset_state(state)
-                del state
+                self._end_run(state, 1, start_mib)
+                if state is not None:
+                    vp.reset_state(state)
+                    del state
                 if self._device.startswith("cuda"):
                     torch.cuda.empty_cache()
 
@@ -279,13 +367,15 @@ class Sam2VideoBackend(Sam2ImageBackend):
         torch, vp = self._torch, self._video_predictor
         with self._video_lock, torch.inference_mode(), self._autocast():
             self.stats.propagations_run += 1
-            state = vp.init_state(
-                video_path=frames_dir,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=False,
-                async_loading_frames=False,
-            )
+            start_mib = self._begin_run()
+            state = None
             try:
+                state = vp.init_state(
+                    video_path=frames_dir,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=False,
+                    async_loading_frames=False,
+                )
                 for obj_id, mask in prompts.items():
                     vp.add_new_mask(state, frame_idx=prompt_index, obj_id=obj_id, mask=torch.from_numpy(mask))
                 for idx, obj_ids, logits in vp.propagate_in_video(state, start_frame_idx=prompt_index):
@@ -295,7 +385,9 @@ class Sam2VideoBackend(Sam2ImageBackend):
                     for k, obj_id in enumerate(obj_ids):  # logits: [len(obj_ids), 1, H, W], in obj_ids order
                         yield idx, obj_id, (logits[k, 0] > 0.0).cpu().numpy()
             finally:
-                vp.reset_state(state)
-                del state
+                self._end_run(state, len(prompts), start_mib)
+                if state is not None:
+                    vp.reset_state(state)
+                    del state
                 if self._device.startswith("cuda"):
                     torch.cuda.empty_cache()

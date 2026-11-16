@@ -1,5 +1,9 @@
 # cvat-sam2 — local SAM 2 for CVAT Community
 
+Build `2026-11-13.1-retained-interpolation` fixes forward deletion and polygon-track re-propagation
+changing retained earlier frames on sparse tracks (handoff audit A1/A2). See
+[release notes and installation](UPDATE_INTERPOLATION_2026-11-13.md). Other production-audit findings remain open.
+
 Pinned: CVAT v2.78.0 (cvat-sdk==2.78.0), sam2 commit 2b90b9f (2024-12-15), SAM 2.1 Hiera-Large.
 
 ```
@@ -71,7 +75,68 @@ SAM 2 loses the object), which the Community UI opens and handles like any track
 - `curl -s localhost:8000/healthz`: `propagations_run` / `frames_propagated` grow, `model_loads` stays 2,
   `propagation_busy` is false again. `sudo docker logs sam2-service` shows no second "Loading SAM 2".
 
-## Automated tests (CPU, no GPU / weights / CVAT): `pip install -r tests/requirements-dev.txt && pytest -q tests`
+## Automated tests (CPU, no GPU / weights / CVAT)
+`pip install -r tests/requirements-dev.txt`, then `./scripts/run_all_tests.sh` (Python + plugin unit tests; add
+`--cvat ~/cvat/cvat` for the real-cvat-core harness and the TypeScript check, which need a CVAT checkout with
+`node_modules`). The summary lists skipped layers: a run with skips is not a full pass. Plain `pytest -q tests` also works.
+
+## Region of interest (ROI): stop tracking where the footage stops being usable
+Mark one or more straight lines; an object is tracked only while it is inside the region they enclose.
+- **Rule.** An object is *inside* while the **centroid of its mask** is inside; the first frame where it is outside, the track
+  ends for good (that frame and all later ones are written as "outside", overwriting older results; it never comes back, even
+  if the mask re-enters). Several lines = the object must be inside **all** of them (a convex region). Lines are infinite: the
+  two points only give the direction. A prompt whose centroid is already outside is refused (400) with the object named;
+  a prompt that merely straddles a line is fine.
+- **Drawing it in CVAT.** Add a label named `roi_line` (type Polyline or Any) to the task. Draw each line as a **polyline
+  track** (so it exists on every frame; a plain shape would only exist on its own frame), on the frame where you start the
+  propagation or earlier. **3 points (recommended):** the line, then a third point on the side to KEEP. **2 points:** the
+  kept side is on your LEFT walking from point 1 to point 2, as seen on screen. Any other number of points is reported, never
+  guessed. The propagate dialog says how many ROI lines it found, and the result message says where objects left the region.
+- **CLI.** `--roi-line X1,Y1,X2,Y2[,X3,Y3]`, repeatable (image pixels, y down), same meaning as above.
+- **Service.** Request field `roi_lines` (list of 4- or 6-number lists, at most `roi_max_lines` = 8, advertised by `/healthz`).
+  The final stream line echoes `roi_lines` (how many were applied) and `dropped` ({object: frame}). Plugin and CLI refuse
+  a service that did not echo it, so an outdated service can never silently ignore the region.
+- **Export.** `cli/cvat_xml_to_yolo.py` keeps `roi_line` out of the classes and writes `roi.json`, so evaluation can ignore
+  detections outside the region; `--sidecar` adds line-aligned `tracks/train/frame_N.txt` ("track_id occluded") next to
+  training-safe label files.
+- **Limits.** Fixed camera only (a line does not move). Convex regions only. The centroid rule drops a straddling object about
+  when half of it has crossed. Dropped objects are still tracked by SAM 2 until the end of the run (the results are discarded;
+  SAM 2 has `remove_object`, not used yet), so the GPU time is not saved.
+
+## Converting an export to YOLO labels (`cli/cvat_xml_to_yolo.py`)
+CVAT's own YOLO exports lose information for this tool's output (YOLO 1.1 / Ultralytics Detection drop polygons; Ultralytics
+Segmentation drops the track id). Export the job as **CVAT for video 1.1** (lossless), then:
+
+    python cli/cvat_xml_to_yolo.py job_export.zip -o yolo_seg                 # polygons, Ultralytics Segmentation layout
+    python cli/cvat_xml_to_yolo.py job_export.zip -o yolo_det --format det    # bounding boxes of the polygons
+    python cli/cvat_xml_to_yolo.py job_export.zip -o yolo_ids --track-ids     # + CVAT track id at the end of each line
+    python cli/cvat_xml_to_yolo.py job_export.zip -o yolo_seg --sidecar       # trainable labels + tracks/ (id, occluded) per line
+
+Layout, number format and file naming mirror CVAT's own Ultralytics Segmentation export (checked: the polygon lines are
+byte-identical to it). `--track-ids` follows the convention CVAT's importer reads, but **Ultralytics' training loader treats
+such lines as corrupt**, so keep that output separate from a folder you train on. Frames between two keyframes, mask shapes
+and other shape types are not exported and are reported on stderr (details in the script's `--help`).
+
+## Operations
+- **Queue.** One propagation runs at a time; others wait in arrival order (`MAX_QUEUE`, default 8 waiting; more -> HTTP 429).
+  The stream sends `{"queued": n}` (n = runs ahead) while waiting; the plugin shows it, the CLI ignores it. A client that
+  disconnects while waiting gives its place back within a few seconds (tested against a real uvicorn server). Frames are
+  downloaded right after joining, so a waiting run's download overlaps the run ahead of it; that also means a queued run
+  occupies disk (JPEG copies of its frames) in the container until its turn: budget `MAX_QUEUE` x range size.
+- **Out of GPU memory** during a run is reported as a clear message in the plugin/CLI ("...ran out of memory while tracking N
+  object(s) over M frames. Nothing was changed. Try fewer objects or a nearer end frame."); the service keeps running. In
+  `/v1/interact` it is HTTP 503.
+- **Rehearse a smaller card:** `GPU_MEMORY_LIMIT_GB=21.5` in `.env` (copy `.env.example`), then
+  `sudo docker compose -f docker-compose.sam2.yml up -d --force-recreate`. Caps PyTorch's allocator only (not the ~0.5 GB CUDA
+  context). `/healthz` -> `gpu` shows total / allocated / reserved / peak MiB; the log prints one line per run
+  ("Propagation finished: frames=.. objects=.. peak=.. MiB (+..)"), measured by PyTorch itself, so unlike `nvidia-smi` it is
+  not affected by other processes on the GPU.
+- **Pinned dependencies.** Dev/CLI: exact versions in `tests/requirements-dev.txt` / `cli/requirements.txt` (full set:
+  `tests/requirements-dev.lock`). Service image: run `sudo ./scripts/freeze_service_deps.sh` once against the working
+  container; it writes `sam-service/constraints.txt`, which the Dockerfile then applies (without it the build warns and is not
+  reproducible). Commit that file.
+- **HTTPS (Oracle VM with a domain):** add `-f docker-compose.sam2.https.yml` to the sam2 compose command, together with
+  CVAT's own `docker-compose.https.yml` for CVAT. Not verified live.
 
 ## Known limitations / technical debt
 - Not verified here (no GPU/CVAT in the dev sandbox): the real SAM 2 video path and the CVAT write-back. Verified:
@@ -87,8 +152,18 @@ SAM 2 loses the object), which the Community UI opens and handles like any track
 - Deleted CVAT frames inside the range are processed like any other frame.
 - A failed or interrupted model run writes nothing to CVAT. The write itself is create -> delete old -> set group,
   so a failure in the middle leaves duplicates (never lost masks); re-run with --yes to replace them.
-- One propagation at a time (a second request gets HTTP 429). Image clicks stay available while it runs.
+- One propagation at a time; others queue (see Operations). If the GPU hangs mid-run the queue stalls behind it (restart the service). Image clicks stay available while a run is in progress.
 - Two copies of the weights in VRAM (image + video predictor), ~1 GB total extra.
 - Embedding cache restores private SAM2ImagePredictor attributes (pinned commit; re-check on upgrade).
 - Service has no authentication; it listens on 127.0.0.1 (host) and on the `cvat_cvat` Docker network.
 - If a client disconnects mid-stream the worker stops at the next frame or after 120 s at the latest.
+
+
+### Existing masks/polygon tracks → tight boxes
+
+Build `2026-11-12.2-box-replace` provides **Menu → SAM 2: convert to box tracks…**. Select one or more polygon tracks or
+mask objects; conversion creates tight axis-aligned rectangle tracks for their full duration in the current job,
+keeps originals by default (or removes them when **Replace originals** is checked), preserves outside gaps and
+metadata, and allocates new track IDs in both modes. Press Ctrl+S to save.
+No margin is added. Only the UI needs rebuilding; the service and Nuclio are unchanged.
+See `plugin/README.md` for geometry conventions, limits, installation and manual checks.

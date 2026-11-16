@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # makes `sam2commo
 
 from sam2common.polygon import mask_to_polygon, polygon_area, polygon_to_mask  # noqa: E402
 from sam2common.rle import cvat_points_to_mask, mask_to_cvat_points, normalize_points, points_area  # noqa: E402
+from sam2common.roi import Roi, RoiError  # noqa: E402
 
 DEFAULT_HOST = os.environ.get("CVAT_HOST_URL", "http://localhost:8080")
 DEFAULT_SERVICE = os.environ.get("SAM2_SERVICE_URL", "http://127.0.0.1:8000")
@@ -286,7 +287,22 @@ def validate_for_cvat(shapes: list[dict]) -> None:
                        f"(frame, points): {bad[:5]}")
 
 
-def run_propagation(url: str, jpegs: list[bytes], meta: dict, read_timeout: float) -> dict[int, list[int] | None]:
+def parse_roi_line(text: str) -> list[float]:
+    """argparse type for --roi-line: 'x1,y1,x2,y2' (kept side = left of the direction 1->2 as seen on screen)
+    or 'x1,y1,x2,y2,x3,y3' (kept side = the side of the third point)."""
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: expected comma-separated numbers")
+    try:
+        Roi([values])  # validates: 4 or 6 finite numbers, distinct points, third point off the line
+    except RoiError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return values
+
+
+def run_propagation(url: str, jpegs: list[bytes], meta: dict, read_timeout: float,
+                    from_frame: int | None = None) -> dict[int, list[int] | None]:
     """POST the frames, consume the NDJSON stream. Returns {relative_index: points|None}.
     Raises ServiceError (and returns nothing) if the stream does not end with {"done": true}."""
     import requests
@@ -326,6 +342,12 @@ def run_propagation(url: str, jpegs: list[bytes], meta: dict, read_timeout: floa
     if done_msg is None:
         raise ServiceError(f"Stream ended without completion after {len(results)} frames")
     check_output_echo(done_msg, meta.get("output", "mask"))
+    wanted = len(meta.get("roi_lines") or [])
+    if wanted and done_msg.get("roi_lines") != wanted:
+        raise ServiceError(f"{wanted} ROI line(s) were sent but the service did not apply them. {OUTDATED_HINT}")
+    for obj, rel in (done_msg.get("dropped") or {}).items():
+        where = f"frame {from_frame + rel}" if from_frame is not None else f"index {rel} of the propagated range"
+        print(f"  the object left the region of interest at {where}; later frames are marked 'not found'", file=sys.stderr)
     return results
 
 
@@ -431,6 +453,8 @@ def cmd_propagate(args) -> int:
         src = find_source(data, shape_id=args.shape_id, group=args.group, track_id=args.track_id,
                           from_frame=args.from_frame)
         poly = args.output == "polygon-track"
+        if args.roi_line and not health.get("roi_max_lines"):
+            raise ServiceError(f"The SAM 2 service does not support a region of interest. {OUTDATED_HINT}")
         if poly and "polygon" not in health.get("outputs", []):
             raise ServiceError(f"The SAM 2 service does not support polygon output. {OUTDATED_HINT}")
         if args.group is not None and poly:
@@ -477,7 +501,9 @@ def cmd_propagate(args) -> int:
                            f"(points tail {src['shape']['points'][-4:]}): {type(e).__name__}: {e}")
         meta = {"prompt_index": 0, "height": height, "width": width, "prompt_points": src_points,
                 "output": "polygon" if poly else "mask", "simplify_px": args.simplify_px}
-        rel = run_propagation(args.service_url, jpegs, meta, args.service_timeout)
+        if args.roi_line:
+            meta["roi_lines"] = args.roi_line
+        rel = run_propagation(args.service_url, jpegs, meta, args.service_timeout, from_frame=from_frame)
         results = {from_frame + i: pts for i, pts in rel.items() if i > 0}  # index 0 = the user's own prompt
         missing = sorted(f for f, p in results.items() if p is None)
         if poly:
@@ -612,6 +638,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--simplify-px", type=float, default=1.5,
                     help="polygon output: simplification tolerance in pixels, 0 = none (default 1.5)")
     sp.add_argument("--to-frame", type=int, help="last frame to fill (default: last frame of the job)")
+    sp.add_argument("--roi-line", action="append", type=parse_roi_line, default=[], metavar="X1,Y1,X2,Y2[,X3,Y3]",
+                    help="region-of-interest line in image pixels, repeatable. 4 numbers: the kept side is on your LEFT "
+                         "walking from point 1 to 2 (as seen on screen); 6 numbers: the kept side is the one holding point 3. "
+                         "The object is dropped for good when its mask centroid leaves the region (all lines must be satisfied)")
     sp.add_argument("--service-url", default=DEFAULT_SERVICE, help=f"SAM 2 service (default {DEFAULT_SERVICE})")
     sp.add_argument("--service-timeout", type=float, default=600.0,
                     help="max seconds to wait for the next result from the service (default 600)")

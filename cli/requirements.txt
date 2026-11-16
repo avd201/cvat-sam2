@@ -1,6 +1,7 @@
 # Python >= 3.10 (cvat-sdk uses `X | None` annotations). Keep cvat-sdk equal to the CVAT server version.
+# Exact versions = the ones the test suite last passed with (Python 3.12, Linux x86_64).
 cvat-sdk==2.78.0
-requests
-pillow
-numpy
-opencv-python-headless>=4.10,<4.12
+requests==2.34.2
+pillow==13.0.0
+numpy==2.2.6
+opencv-python-headless==4.11.0.86

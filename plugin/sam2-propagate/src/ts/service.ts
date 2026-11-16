@@ -17,6 +17,7 @@ async function streamMessages(
     body: PropagateBody,
     onMessage: (message: Message) => void,
     signal: AbortSignal,
+    onQueued?: (ahead: number) => void,
 ): Promise<Message> {
     let response: Response;
     try {
@@ -39,6 +40,7 @@ async function streamMessages(
     let received = 0;
     const handle = (message: Message): void => {
         if (message.error) throw new ServiceError(`Service error after ${received} results: ${message.error}`);
+        if (typeof message.queued === 'number') onQueued?.(message.queued); // waiting for the GPU; no result yet
         if (typeof message.frame === 'number') {
             received += 1;
             onMessage(message);
@@ -71,6 +73,13 @@ async function streamMessages(
             + 'the service is outdated and must be rebuilt.',
         );
     }
+    if (body.roi_lines?.length && finalMessage.roi_lines !== body.roi_lines.length) {
+        // An older service ignores the field and would track everything: the annotator must not believe the ROI was enforced.
+        throw new ServiceError(
+            `A region of interest with ${body.roi_lines.length} line(s) was sent but the service did not apply it; `
+            + 'the service is outdated and must be rebuilt. Nothing was changed.',
+        );
+    }
     return finalMessage;
 }
 
@@ -79,12 +88,15 @@ export async function runPropagation(
     body: PropagateBody,
     onFrame: (count: number) => void,
     signal: AbortSignal,
+    onQueued?: (ahead: number) => void,
+    onDone?: (final: Message) => void,
 ): Promise<Map<number, number[] | null>> {
     const relative = new Map<number, number[] | null>();
-    await streamMessages(body, (m) => {
+    const final = await streamMessages(body, (m) => {
         relative.set(m.frame as number, m.points ?? null);
         onFrame(relative.size);
-    }, signal);
+    }, signal, onQueued);
+    onDone?.(final);
     return relative;
 }
 
@@ -96,6 +108,8 @@ export async function runPropagationMulti(
     body: PropagateBody,
     onResult: (count: number) => void,
     signal: AbortSignal,
+    onQueued?: (ahead: number) => void,
+    onDone?: (final: Message) => void,
 ): Promise<Map<number, Map<number, number[] | null>>> {
     const expected = body.objects?.length ?? 0;
     const byObject = new Map<number, Map<number, number[] | null>>();
@@ -106,7 +120,8 @@ export async function runPropagationMulti(
         (byObject.get(m.obj) as Map<number, number[] | null>).set(m.frame as number, m.points ?? null);
         count += 1;
         onResult(count);
-    }, signal);
+    }, signal, onQueued);
+    onDone?.(finalMessage);
     if (finalMessage.objects !== expected || byObject.size !== expected) {
         throw new ServiceError(
             `The service tracked ${byObject.size} of ${expected} objects; nothing was changed.`,

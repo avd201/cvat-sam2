@@ -32,10 +32,49 @@ async function stateOnFrame(job: Job, frame: number, clientID: number): Promise<
     return found;
 }
 
+async function preserveRetainedBoundary(job: Job, frame: number, clientID: number): Promise<void> {
+    const boundary = await stateOnFrame(job, frame, clientID);
+    if (boundary.keyframe) return;
+
+    // CVAT re-matches/resamples polygon vertices for each keyframe interval. Splitting an interval
+    // with just one anchor can therefore change earlier geometry (especially with unequal vertex
+    // counts). Freeze every retained interpolated frame in ONLY the interval being split.
+    // Capture them all before saving anything: even the first added keyframe changes interpolation.
+    const previous = boundary.keyframes?.prev;
+    const start = Math.max(job.startFrame, previous === null || previous === undefined ? job.startFrame : previous + 1);
+    const retained: {
+        state: ObjectState; points: number[]; outside: boolean; occluded: boolean;
+        zOrder: number; rotation: number; attributes: Record<number, string>;
+    }[] = [];
+    for (let f = start; f <= frame; f++) {
+        // eslint-disable-next-line no-await-in-loop
+        const st = await stateOnFrame(job, f, clientID);
+        retained.push({
+            state: st, points: [...st.points], outside: st.outside, occluded: st.occluded,
+            zOrder: st.zOrder, rotation: st.rotation, attributes: { ...st.attributes },
+        });
+    }
+    for (const snapshot of retained) {
+        const st = snapshot.state;
+        // Mark the captured values as explicit updates: keyframe=true alone makes core copy its
+        // CURRENT interpolation, which may already differ after saving an earlier retained frame.
+        st.points = snapshot.points;
+        st.outside = snapshot.outside;
+        st.occluded = snapshot.occluded;
+        st.zOrder = snapshot.zOrder;
+        st.rotation = snapshot.rotation;
+        st.attributes = snapshot.attributes;
+        st.keyframe = true;
+        // eslint-disable-next-line no-await-in-loop
+        await st.save();
+    }
+}
+
 /** Re-propagation of an existing polygon track: edit its keyframes in place, so its id is preserved. */
 async function updateTrackInPlace(ctx: ApplyContext): Promise<string> {
     const { job, state } = ctx;
     const steps = planTrackUpdates(ctx.results, ctx.fromFrame, ctx.toFrame);
+    if (steps.length) await preserveRetainedBoundary(job, ctx.fromFrame, state.clientID as number);
     for (const step of steps) {
         // eslint-disable-next-line no-await-in-loop
         const st = await stateOnFrame(job, step.frame, state.clientID as number);
@@ -177,6 +216,8 @@ async function deleteTrackForward(ctx: DeleteContext, cut: number): Promise<stri
         return 'Deleted the whole track (it starts at or after the cut frame).';
     }
     if (cut > ctx.stopFrame) return 'Nothing follows this frame: nothing deleted.';
+
+    await preserveRetainedBoundary(job, cut - 1, id);
 
     // keyframes at or after the cut, found by walking the track's own keyframe links
     const later: number[] = [];

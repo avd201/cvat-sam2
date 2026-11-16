@@ -60,7 +60,7 @@ def backend():
 @pytest.fixture()
 def client(backend):
     app.state.backend = backend
-    app.state.propagation_lock = None
+    app.state.gpu_queue = None
     with TestClient(app) as c:
         yield c
     app.state.backend = None
@@ -109,15 +109,6 @@ def test_error_midway_is_reported_and_service_recovers(client, backend):
     assert "error" in msgs[-1] and "after 2 frames" in msgs[-1]["error"]
     backend.fail_at_frame = None
     assert lines(post(client, n=3))[-1]["done"] is True  # lock was released, state clean
-
-
-def test_concurrent_propagation_gets_429(client):
-    assert service_main.app.state.propagation_lock.acquire(blocking=False)
-    try:
-        assert post(client, n=2).status_code == 429
-    finally:
-        service_main.app.state.propagation_lock.release()
-    assert post(client, n=2).status_code == 200
 
 
 @pytest.mark.parametrize(
