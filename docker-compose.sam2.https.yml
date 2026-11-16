@@ -2,10 +2,8 @@
 # routers to the `websecure` entrypoint (:443) and makes plain HTTP redirect there. Without this file our /sam2
 # router would stay on `web`, i.e. behind that redirect, and the plugin's POST would never reach the service.
 #
-#   cd ~/cvat/cvat-sam2
-#   CVAT_HOST=cvat.example.org sudo -E docker compose -f docker-compose.sam2.yml -f docker-compose.sam2.https.yml \
-#       up -d --force-recreate sam2-service
-# (or put CVAT_HOST=... in .env; CVAT_HOST must be the real domain: the Traefik rule matches on it)
+#   ./scripts/compose.sh --https sam2 up -d --force-recreate
+# Reads the same .env as CVAT. See docs/DEPLOYMENT.md for DNS, certificates and CVAT setup.
 #
 # `lets-encrypt` is the certificate resolver defined by CVAT's docker-compose.https.yml (v2.78.0). Not verified live.
 services:

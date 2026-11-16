@@ -47,7 +47,7 @@ layer "1. Python tests (service, CLI, queue)" py_layer
 # ---------------------------------------------------------------- 2. plugin unit tests
 node_layer() {
   local out rc; out="$(mktemp)"
-  (cd "$ROOT/plugin/sam2-propagate" && node --experimental-strip-types --test test/*.test.mjs >"$out" 2>&1)
+  (cd "$ROOT/plugin/sam2-propagate" && node --experimental-strip-types --test --test-reporter=tap test/*.test.mjs >"$out" 2>&1)
   rc=$?                                  # node's own exit status (NOT the status of the grep below)
   grep -E '^# (tests|pass|fail|skipped)|^not ok' "$out"
   [ "$rc" -ne 0 ] && tail -40 "$out"

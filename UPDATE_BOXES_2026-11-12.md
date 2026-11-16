@@ -1,3 +1,5 @@
+> Historical release notes imported from the verified archive. For current installation commands and image names, use [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Do not extract the old ZIP over this checkout.
+
 # Tight AABB track conversion — 2026-11-12.2-box-replace
 
 This archive is the complete project, including the existing ROI implementation.

@@ -1,3 +1,5 @@
+> Historical release notes imported from the verified archive. For current installation commands and image names, use [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Do not extract the old ZIP over this checkout.
+
 # Retained interpolation — 2026-11-13.1-retained-interpolation
 
 Source archive: `cvat-sam2-2026-11-13-retained-interpolation-fixes.zip`.

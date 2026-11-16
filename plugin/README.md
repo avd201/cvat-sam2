@@ -32,15 +32,13 @@ range and prompt; the service downloads the frames itself from CVAT **using the 
 CVAT's own permissions apply and an unauthenticated caller never reaches the GPU. Only that endpoint is routed
 through Traefik (see `docker-compose.sam2.yml`).
 
-## Build / install (once per CVAT version)
-Prerequisites: CVAT checkout **at tag v2.78.0**, `sam2-service` rebuilt from this repo and running.
-```
-sudo ./plugin/build_ui.sh ~/cvat/cvat            # ~10+ min, several GB RAM; builds cvat/ui:v2.78.0 with the plugin
-cd ~/cvat/cvat && sudo docker compose -f docker-compose.yml -f components/serverless/docker-compose.serverless.yml up -d cvat_ui
-cd ~/cvat/cvat-sam2 && sudo docker compose -f docker-compose.sam2.yml up -d --build --force-recreate   # Traefik labels
-```
-Hard-refresh the browser (Ctrl+Shift+R). A CVAT upgrade requires a rebuild against the new tag, and a re-check that the
-APIs below still exist.
+## Build / install
+
+Follow the [deployment guide](../docs/DEPLOYMENT.md), including its existing-installation migration steps.
+The project root contains the release source; no ZIP extraction is needed.
+`plugin/build_ui.sh` builds a dedicated `cvat/ui:sam2-v2.78.0-<plugin-version>` image.
+Use `scripts/compose.sh` from the repository root to activate it with the required overlays.
+A CVAT upgrade requires compatibility work and a new UI build; v2.78.0 is the supported version.
 
 ## Waiting for the GPU
 If another run is in progress the dialog says how many runs are ahead ("Waiting for the GPU: n propagation(s) ahead"); it then continues by itself. Cancel works while waiting. A full queue (HTTP 429) is reported as such.
@@ -82,9 +80,7 @@ Polylines labelled `roi_line` on the current frame (2 or 3 points, see the main 
 
 ## Which build is running? (version stamp)
 `plugin/VERSION` is baked into the UI image by `build_ui.sh`. After a hard refresh, the browser console (F12) prints
-`[SAM 2 plugin] version <VERSION> loaded` when the plugin starts. If a build finishes in seconds with every Docker step
-`CACHED`, nothing new was compiled in: you most likely extracted an older zip (browsers rename repeated downloads to
-`name(2).zip`, `name(3).zip`, ...). Check with `cat plugin/VERSION` and compare with the zip you intended to install.
+`[SAM 2 plugin] version <VERSION> loaded` when the plugin starts. Docker may legitimately reuse cached layers. Verify the browser version against `cat plugin/VERSION` and the active container image instead of using build duration as evidence.
 
 ## Several objects at once
 Select **several objects on the same frame** and run **SAM 2: propagate object(s)…** once. In CVAT v2.78.0, hold the
@@ -133,16 +129,5 @@ inspect the result before saving. Reference ground-truth annotations cannot be r
 this initial version does not update earlier conversions. Re-propagating a source later also requires rebuilding
 its boxes manually. As with propagation, this import does not create a single Undo action.
 
-This is a UI-only change: rebuild the UI with `sudo ./plugin/build_ui.sh ~/cvat/cvat`, recreate `cvat_ui` using
-the existing deployment command, and hard-refresh the browser. No SAM service or Nuclio rebuild is needed.
-The build script's required positional argument is the CVAT checkout; its optional second argument is the image
-version (default `v2.78.0`, which must match the checkout tag). No new CLI options were added.
-
-Manual acceptance check (not yet run against a live server):
-
-- Convert a polygon track with two spaced keyframes; inspect boxes on intermediate frames and on both sides of an outside gap.
-- Convert a mask group with a missing frame and later reappearance; check one box track, a gap, and a resumed box.
-- With the checkbox unchecked, verify originals remain. With it checked, verify converted source tracks/groups are removed
-  while other objects remain. Box labels/groups/attributes/occluded flags must match; an ROI-closed source stays closed.
-- Save, reload the job, and export a box-based format to verify the boxes persist.
-- Try multiple selected objects, cancellation, and two masks sharing one group on one frame (must refuse the ambiguous group).
+For installation and UI-only updates, follow the [deployment guide](../docs/DEPLOYMENT.md).
+The build script requires the CVAT checkout path and optionally its CVAT version (default `v2.78.0`).
