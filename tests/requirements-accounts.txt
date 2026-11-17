@@ -1,0 +1,6 @@
+# Isolated account-policy integration tests; matches CVAT v2.78.0's auth stack.
+Django==5.2.14
+django-allauth[socialaccount]==65.18.0
+dj-rest-auth==7.2.0
+djangorestframework==3.17.1
+pytest>=8

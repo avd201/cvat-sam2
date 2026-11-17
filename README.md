@@ -27,6 +27,8 @@ Propagation:      browser → CVAT Traefik /sam2 → SAM service → CVAT frames
 
 Nuclio functions do not publish host ports. The Compose helper configures internal dashboard invocation and keeps the dashboard private. Existing installations must follow the [private Nuclio migration steps](docs/DEPLOYMENT.md#upgrade-an-existing-installation-to-private-nuclio-invocation), including redeploying the function; pulling the code alone does not close its old port.
 
+Public signup is disabled server-side by the Compose helper. Administrators create annotator accounts, then assign jobs or invite those existing accounts to organizations. See [approved account provisioning and migration](docs/DEPLOYMENT.md#approved-accounts-only); existing installations must recreate `cvat_server` and review previously registered accounts.
+
 - [Deployment and troubleshooting](docs/DEPLOYMENT.md)
 - [Plugin usage: selection, correction, deletion, ROI, boxes](plugin/README.md)
 - [CLI, output formats, ROI and export workflows](docs/WORKFLOWS.md)

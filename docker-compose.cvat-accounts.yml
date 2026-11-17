@@ -1,0 +1,12 @@
+# Included by scripts/compose.sh for both HTTP and HTTPS deployments.
+services:
+  cvat_server:
+    environment:
+      DJANGO_SETTINGS_MODULE: cvat_accounts.settings
+    volumes:
+      - type: bind
+        source: ${CVAT_SAM2_ROOT:?Use scripts/compose.sh}/deployment/cvat_accounts
+        target: /home/django/cvat_accounts
+        read_only: true
+        bind:
+          create_host_path: false
