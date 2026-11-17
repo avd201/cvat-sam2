@@ -20,10 +20,12 @@ The project root now contains **`2026-11-13.1-retained-interpolation`**. Clone t
 The UI plugin is compiled into a dedicated local CVAT image. `scripts/compose.sh` applies the required overlays and reads one shared `.env` for both Compose projects. Keep CVAT at the supported tag: the plugin uses internal CVAT APIs.
 
 ```text
-Interactive mask: browser → CVAT → Nuclio proxy → SAM service
+Interactive mask: browser → CVAT → internal Nuclio dashboard → Nuclio proxy → SAM service
 Propagation:      browser → CVAT Traefik /sam2 → SAM service → CVAT frames
                   results → browser annotations → Ctrl+S to persist
 ```
+
+Nuclio functions do not publish host ports. The Compose helper configures internal dashboard invocation and keeps the dashboard private. Existing installations must follow the [private Nuclio migration steps](docs/DEPLOYMENT.md#upgrade-an-existing-installation-to-private-nuclio-invocation), including redeploying the function; pulling the code alone does not close its old port.
 
 - [Deployment and troubleshooting](docs/DEPLOYMENT.md)
 - [Plugin usage: selection, correction, deletion, ROI, boxes](plugin/README.md)

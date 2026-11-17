@@ -23,6 +23,8 @@ pydantic==2.14.2
 pydantic_core==2.50.2
 Pygments==2.21.0
 pytest==9.2.0
+# Added for parsing the Nuclio deployment security contract.
+PyYAML==6.0.3
 python-dateutil==4.0.0
 python-multipart==0.0.20
 requests==2.34.2

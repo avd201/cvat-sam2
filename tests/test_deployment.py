@@ -9,6 +9,7 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / 'plugin/VERSION').read_text().strip()
@@ -78,10 +79,56 @@ def test_actual_cvat_configuration(deployment, https):
     assert services['cvat_server']['image'] == 'cvat/server:v2.78.0'
     assert str(services['cvat_server']['environment']['CVAT_SERVERLESS']) == '1'
     assert services['nuclio']['image'] == 'quay.io/nuclio/dashboard:1.16.3-amd64'
+    for name in ['cvat_server', 'cvat_worker_annotation']:
+        assert services[name]['environment']['CVAT_NUCLIO_INVOKE_METHOD'] == 'dashboard'
+    assert not services['nuclio'].get('ports')
+    assert services['nuclio']['labels']['traefik.enable'] == 'false'
     for name in ['cvat', 'cvat-ui']:
         svc = services['cvat_server' if name == 'cvat' else 'cvat_ui']
         assert svc['labels'][f'traefik.http.routers.{name}.entrypoints'] == ('websecure' if https else 'web')
         assert 'annotate.example.org' in svc['labels'][f'traefik.http.routers.{name}.rule']
+
+
+def test_nuclio_function_has_no_host_port():
+    function = yaml.safe_load((ROOT / 'nuclio/sam2-proxy-interactor/function.yaml').read_text())
+    triggers = function['spec']['triggers']
+    http_triggers = [trigger for trigger in triggers.values() if trigger['kind'] == 'http']
+    assert http_triggers
+    for trigger in http_triggers:
+        assert trigger['attributes']['disablePortPublishing'] is True
+        # An explicit port takes precedence over disablePortPublishing in Nuclio 1.16.3.
+        assert not trigger['attributes'].get('port')
+
+
+def test_security_overlay_removes_existing_dashboard_publication(tmp_path):
+    if shutil.which('docker') is None:
+        pytest.skip('Docker Compose CLI unavailable')
+    base = tmp_path / 'compose.yml'
+    base.write_text('''services:
+  cvat_server:
+    image: cvat/server:v2.78.0
+    environment:
+      CVAT_NUCLIO_INVOKE_METHOD: direct
+  cvat_worker_annotation:
+    image: cvat/server:v2.78.0
+    environment:
+      CVAT_NUCLIO_INVOKE_METHOD: direct
+  nuclio:
+    image: quay.io/nuclio/dashboard:1.16.3-amd64
+    ports: ["8070:8070"]
+    labels:
+      traefik.enable: "true"
+''')
+    config = json.loads(subprocess.check_output([
+        'docker', 'compose', '-f', str(base),
+        '-f', str(ROOT / 'docker-compose.cvat-serverless.yml'),
+        'config', '--format', 'json',
+    ], text=True))
+    services = config['services']
+    assert not services['nuclio'].get('ports')
+    assert services['nuclio']['labels']['traefik.enable'] == 'false'
+    for name in ['cvat_server', 'cvat_worker_annotation']:
+        assert services[name]['environment']['CVAT_NUCLIO_INVOKE_METHOD'] == 'dashboard'
 
 
 def test_missing_configuration_fails_before_docker(deployment):

@@ -1,0 +1,13 @@
+# Apply after CVAT's serverless overlay. Functions are reachable only on the Docker network.
+services:
+  cvat_server:
+    environment:
+      CVAT_NUCLIO_INVOKE_METHOD: dashboard
+  cvat_worker_annotation:
+    environment:
+      CVAT_NUCLIO_INVOKE_METHOD: dashboard
+  nuclio:
+    # The dashboard can invoke functions and controls Docker: never publish it.
+    ports: !reset []
+    labels:
+      traefik.enable: "false"
