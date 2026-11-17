@@ -29,6 +29,7 @@ if [[ "$PROJECT" == cvat ]]; then
   CVAT_DIR="$(cd "$CVAT_DIR" && pwd)"
   FILES=(-f "$CVAT_DIR/docker-compose.yml"
          -f "$CVAT_DIR/components/serverless/docker-compose.serverless.yml"
+         -f "$ROOT/docker-compose.cvat-serverless.yml"
          -f "$ROOT/docker-compose.cvat-ui.yml")
   if $HTTPS; then FILES+=(-f "$CVAT_DIR/docker-compose.https.yml"); fi
   exec docker compose --project-name cvat --project-directory "$CVAT_DIR" \

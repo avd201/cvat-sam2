@@ -179,7 +179,24 @@ Deploy the lightweight interactive proxy:
 nuctl get function --platform local
 ```
 
-Expect `sam2-service-interactor` to become `ready`. The proxy reaches `http://sam2-service:8000` on `cvat_cvat`; it does not load another GPU model. The Nuclio dashboard need not be publicly exposed.
+Expect `sam2-service-interactor` to become `ready`. The proxy reaches `http://sam2-service:8000` on `cvat_cvat`; it does not load another GPU model. Its HTTP trigger has `disablePortPublishing: true`: there must be no published host port for this function. CVAT's server and annotation worker invoke it through the internal Nuclio dashboard using `CVAT_NUCLIO_INVOKE_METHOD=dashboard`, set by `docker-compose.cvat-serverless.yml` through the helper. Keep this overlay applied to both HTTP and HTTPS deployments.
+
+The Nuclio dashboard **must remain private**: it can invoke functions and has Docker-socket access. The overlay clears its published ports and disables its Traefik routing. Keep SAM's raw port loopback-only and allow only required ingress at the cloud firewall. Raw inference endpoints still trust the host/Docker network; do not attach untrusted workloads to it. Do not add a function trigger `port`: Nuclio 1.16.3 gives an explicit port precedence over `disablePortPublishing`.
+
+### Upgrade an existing installation to private Nuclio invocation
+
+Updating files alone does not remove the old function's published port. During a maintenance window, update CVAT's invocation method and redeploy the function:
+
+```bash
+./scripts/compose.sh cvat up -d --no-deps --force-recreate cvat_server cvat_worker_annotation nuclio
+./deploy_nuclio.sh
+```
+
+For HTTPS deployments, use `./scripts/compose.sh --https cvat ...` for the first command. No SAM model or UI rebuild is needed for this security change. Restrict ingress before migrating so the old function port is not exposed during the change.
+
+Inspect `docker ps --format 'table {{.Names}}\t{{.Ports}}'` and identify the `sam2-service-interactor` function container. For that actual container name, run `docker port CONTAINER_NAME`: it must print nothing. `docker port nuclio` must also print nothing. An internal `8080/tcp` in `docker ps` is not a published port; a host mapping such as `0.0.0.0:32768->8080/tcp` is. Stop rollout if either container still has a host mapping.
+
+Verify AI Tools interactive segmentation from an authenticated CVAT job, then propagation. From another machine, verify that the previous function port and dashboard port cannot be reached. Check this again after redeployment. CVAT login protects the public invocation path; internal networking provides the boundary around the unauthenticated proxy and raw SAM endpoints.
 
 ## 6. Verify the plugin and routing
 
