@@ -21,6 +21,7 @@ def deployment(tmp_path):
     root = tmp_path / 'sam2 checkout'
     root.mkdir()
     shutil.copytree(ROOT / 'scripts', root / 'scripts')
+    shutil.copytree(ROOT / 'deployment', root / 'deployment')
     for path in ROOT.glob('docker-compose*.yml'):
         shutil.copy(path, root / path.name)
     (root / '.env').write_text(
@@ -78,6 +79,12 @@ def test_actual_cvat_configuration(deployment, https):
     assert services['cvat_ui']['pull_policy'] == 'never'
     assert services['cvat_server']['image'] == 'cvat/server:v2.78.0'
     assert str(services['cvat_server']['environment']['CVAT_SERVERLESS']) == '1'
+    assert services['cvat_server']['environment']['DJANGO_SETTINGS_MODULE'] == 'cvat_accounts.settings'
+    accounts = next(v for v in services['cvat_server']['volumes']
+                    if v['target'] == '/home/django/cvat_accounts')
+    assert accounts['source'] == str(deployment[0] / 'deployment/cvat_accounts')
+    assert accounts['read_only'] is True
+    assert accounts['bind'].get('create_host_path', False) is False
     assert services['nuclio']['image'] == 'quay.io/nuclio/dashboard:1.16.3-amd64'
     for name in ['cvat_server', 'cvat_worker_annotation']:
         assert services[name]['environment']['CVAT_NUCLIO_INVOKE_METHOD'] == 'dashboard'

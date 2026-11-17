@@ -145,6 +145,43 @@ docker network inspect cvat_cvat
 
 Open `http://localhost:8080` (or `http://YOUR_HOST:8080`) and log in. The `cvat_cvat` network must exist before starting SAM. Do not change the CVAT Compose project name; the proxy and service depend on that network name.
 
+### Approved accounts only
+
+The helper always includes `docker-compose.cvat-accounts.yml`. It mounts `deployment/cvat_accounts` read-only and selects settings that extend CVAT's production settings. Public REST registration is denied explicitly; allauth signup is also closed. Existing login, password changes/reset, and administrator account creation remain available. The registration page may still appear in the UI, but it cannot create an account. This policy applies to the supported BASIC-auth deployment, not a custom SSO/LDAP configuration.
+
+Create the initial administrator with `createsuperuser` above. Then use `https://YOUR_HOST/admin/` (or HTTP through the SSH tunnel during setup):
+
+1. Sign in as the administrator and open **Users → Add user**.
+2. Create an individual account for each approved annotator with a unique username, email and strong temporary password. Share credentials through a private channel and have the user change the password after signing in.
+3. Keep annotators active, but **do not grant staff or superuser status or the admin group**. CVAT assigns its default `user` role to newly created ordinary accounts.
+4. Assign only the intended projects/jobs, or invite the already-created account to the intended CVAT organization using the matching email and minimum necessary role.
+
+An organization invitation grants membership; it does not authorize self-registration. Create the account first. This deployment does not implement invitation-token signup or automated invitation emails for new accounts. All approved accounts with access to a job can use SAM; there is no separate GPU entitlement policy.
+
+For an existing installation, review existing users in Django Admin and deactivate unapproved accounts before opening external access. Disabling signup does not revoke existing accounts. Apply the policy with:
+
+```bash
+./scripts/compose.sh cvat up -d --no-deps --force-recreate cvat_server
+```
+
+Use `./scripts/compose.sh --https cvat ...` on HTTPS installations. No image rebuild is needed. Keep the mounted package present; a missing package must prevent startup, not silently restore open signup. If you already customize `DJANGO_SETTINGS_MODULE`, integrate and verify this policy with your custom settings before deployment.
+
+Before onboarding, verify on the target installation:
+
+- A direct unauthenticated POST to `/api/auth/register`, with valid registration fields, returns 401/403 and creates no user. Repeat with an authenticated account; it must also fail. A registration request with an invitation query parameter must not bypass the policy.
+- A normal administrator-created annotator can log in, access only their assigned data, and use interactive segmentation and propagation. An inactive account cannot log in.
+- An organization invitation can be accepted by its intended existing account. Password change/reset still works (email reset requires working SMTP).
+
+The isolated policy tests exercise the pinned Django/dj-rest-auth stack and the upstream CVAT account adapter, without a running CVAT database or GPU:
+
+```bash
+python3 -m venv .venv-accounts
+.venv-accounts/bin/pip install -r tests/requirements-accounts.txt
+CVAT_CHECKOUT=/path/to/cvat .venv-accounts/bin/python tests/accounts/check_policy.py
+```
+
+The ordinary pytest suite also runs this integration check when these dependencies and `CVAT_CHECKOUT` are available; otherwise it reports a skip. Live CVAT acceptance remains required.
+
 ## 5. Install Nuclio CLI and start SAM
 
 Match the CLI to CVAT's Nuclio dashboard version:

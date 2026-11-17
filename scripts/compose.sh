@@ -19,6 +19,7 @@ fi
 command -v docker >/dev/null || { echo "Install Docker Engine and the Compose plugin first." >&2; exit 1; }
 # Pin every CVAT backend/worker even if an old shell or .env selects another version.
 export CVAT_VERSION=v2.78.0
+export CVAT_SAM2_ROOT="$ROOT"
 FILES=()
 if [[ "$PROJECT" == cvat ]]; then
   CVAT_DIR="${CVAT_DIR:-$ROOT/../cvat}"
@@ -30,6 +31,7 @@ if [[ "$PROJECT" == cvat ]]; then
   FILES=(-f "$CVAT_DIR/docker-compose.yml"
          -f "$CVAT_DIR/components/serverless/docker-compose.serverless.yml"
          -f "$ROOT/docker-compose.cvat-serverless.yml"
+         -f "$ROOT/docker-compose.cvat-accounts.yml"
          -f "$ROOT/docker-compose.cvat-ui.yml")
   if $HTTPS; then FILES+=(-f "$CVAT_DIR/docker-compose.https.yml"); fi
   exec docker compose --project-name cvat --project-directory "$CVAT_DIR" \
